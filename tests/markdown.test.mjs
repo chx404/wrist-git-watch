@@ -5,7 +5,10 @@ import { stripTypeScriptTypes } from 'node:module';
 
 const source = await readFile(new URL('../entry/src/main/ets/common/Markdown.ets', import.meta.url), 'utf8');
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString('base64')}`;
-const { parseMarkdown, MARKDOWN_SOURCE_LIMIT, MARKDOWN_BLOCK_LIMIT, MARKDOWN_PAGE_BLOCKS } = await import(moduleUrl);
+const {
+  parseMarkdown, resolveMarkdownImage, MARKDOWN_SOURCE_LIMIT, MARKDOWN_BLOCK_LIMIT, MARKDOWN_PAGE_BLOCKS,
+  MARKDOWN_IMAGE_LIMIT,
+} = await import(moduleUrl);
 const blocks = (doc) => doc.pages.flatMap((page) => page.blocks);
 const text = (node) => node.runs.map((run) => run.text).join('');
 
@@ -82,7 +85,7 @@ test('keeps visible inline and reference labels but only activates local fragmen
   assert.doesNotMatch(text(p), /javascript|example\.test|%zz/);
 });
 
-test('render model only keeps image alt text and never retains an image request target', () => {
+test('without README context the render model keeps just the image fallback', () => {
   const doc = parseMarkdown([
     '<!-- This comment', 'is not rendered -->', '<picture>',
     '<source srcset="https://private.example/track">',
@@ -93,8 +96,92 @@ test('render model only keeps image alt text and never retains an image request 
   ].join('\n'));
   const rendered = blocks(doc).flatMap((node) => node.runs).filter((run) => run.image);
   assert.deepEqual(rendered.map((run) => run.text), ['［图片：Build & test］', '［图片：CI］', '［图片：Logo］', '［图片］']);
-  assert.ok(rendered.every((run) => run.anchor === '' && !('url' in run)));
+  assert.ok(rendered.every((run) => run.anchor === '' && run.imageUrl === ''));
   assert.doesNotMatch(blocks(doc).map(text).join('\n'), /private\.example|raw\.githubusercontent|deadbeef|This comment/);
+});
+
+test('README Markdown, reference and HTML images produce separate native image targets in source order', () => {
+  const doc = parseMarkdown([
+    'Before ![Shot](<./docs/Watch preview.png> "Title")![Icon](/assets/icon.svg) after', '',
+    '[![Build][build]](#details) <IMG width="9000" src="https://Avatars.githubusercontent.com/u/1?s=32&amp;v=4" alt="Avatar">', '',
+    '<picture><source srcset="./never-loaded.png"><img data-x="other src=./fake.png" alt="Build &amp; test" src=./real.png></picture>', '',
+    '[build]: https://github.com/Owner/Repo/blob/main/status.svg?raw=true',
+    '## Details',
+  ].join('\n'), 'Owner/Repo', 'feature/preview');
+  const runs = blocks(doc).flatMap((node) => node.runs);
+  const images = runs.filter((run) => run.image);
+  assert.deepEqual(images.map(({ text, imageUrl }) => [text, imageUrl]), [
+    ['［图片：Shot］', 'https://raw.githubusercontent.com/Owner/Repo/feature/preview/docs/Watch%20preview.png'],
+    ['［图片：Icon］', 'https://raw.githubusercontent.com/Owner/Repo/feature/preview/assets/icon.svg'],
+    ['［图片：Build］', 'https://raw.githubusercontent.com/Owner/Repo/main/status.svg'],
+    ['［图片：Avatar］', 'https://avatars.githubusercontent.com/u/1?s=32&v=4'],
+    ['［图片：Build & test］', 'https://raw.githubusercontent.com/Owner/Repo/feature/preview/real.png'],
+  ]);
+  assert.equal(images[2].anchor, 'details');
+  assert.equal(runs[0].text, 'Before ');
+  assert.equal(runs[3].text, ' after');
+});
+
+test('image URL resolution accepts known GitHub image routes and normalizes safe repository paths', () => {
+  const attachment = 'https://github.com/user-attachments/assets/c7ca57d1-feb3-44e6-a36c-d2c037ab4754';
+  const legacyAttachment = 'https://github.com/a/b/assets/123/c7ca57d1-feb3-44e6-a36c-d2c037ab4754';
+  const workflow = 'https://github.com/a/b/actions/workflows/ci.yml/badge.svg?branch=release%2Fwatch&event=push';
+  const media = 'https://media.githubusercontent.com/media/a/b/refs/heads/main/art.png';
+  const upload = 'https://user-images.githubusercontent.com/1234/abc-456.gif';
+  for (const url of [attachment, legacyAttachment, workflow, media, upload]) {
+    assert.equal(resolveMarkdownImage(url), url);
+  }
+  assert.equal(resolveMarkdownImage('https://RAW.GITHUBusercontent.com/a/b/main/pic.PNG#gh-dark-mode-only'),
+    'https://raw.githubusercontent.com/a/b/main/pic.PNG');
+  assert.equal(resolveMarkdownImage('./docs/sub/../图.png?raw=1', 'a/b', 'v1.2.0'),
+    'https://raw.githubusercontent.com/a/b/v1.2.0/docs/%E5%9B%BE.png');
+  assert.equal(resolveMarkdownImage('/images/test%20one.png', 'a/b', 'HEAD'),
+    'https://raw.githubusercontent.com/a/b/HEAD/images/test%20one.png');
+});
+
+test('image URL policy fails closed on third parties, unsafe authorities, routes, and traversal', () => {
+  const blocked = [
+    '//raw.githubusercontent.com/a/b/main/image.png', 'http://raw.githubusercontent.com/a/b/main/image.png',
+    'https://localhost/logo.png', 'https://10.1.2.3/logo.png', 'https://[::1]/logo.png', 'https://0x7f000001/logo.png',
+    'https://raw.githubusercontent.com.evil.test/a/b/main/image.png', 'https://raw.githubusercontent.com./a/b/main/image.png',
+    'https://raw.githubusercontent.com@evil.test/a/b/main/image.png', 'https://user:secret@raw.githubusercontent.com/a/b/main/image.png',
+    'https://raw.githubusercontent.com:443/a/b/main/image.png', 'https://raw.githubusercontent.com\\@evil.test/a/b/main/image.png',
+    'https://raw.githubusercontent.com/a/b/main/image.png?token=untrusted',
+    'https://github.com/login?return_to=https://localhost/logo.png', 'https://github.com/a/b/issues/1.png',
+    'https://github.com/a/b/blob/main/x%2F..%2Fp.png', 'https://raw.githubusercontent.com/a/b/main/%2e%2e/p.png',
+    'https://camo.githubusercontent.com/123/456.png', 'https://images.example.test/tracker.png',
+    'https://img.shields.io/badge/status-ok-green.svg', 'https://a.github.io/image.png',
+    'file:///logo.png', 'data:image/png;base64,abc', 'javascript:logo.png', '#logo.png',
+    '../other/logo.png', './sub/../../logo.png', '%2e%2e/logo.png', 'dir/%252e%252e/logo.png',
+    'dir/logo%5Cother.png', 'dir/logo%0Aother.png', 'dir/logo%zz.png', 'dir//logo.png', 'README.md', 'logo.png?url=x',
+    `${'a'.repeat(1024)}.png`,
+  ];
+  for (const url of blocked) {
+    assert.equal(resolveMarkdownImage(url, 'owner/repo', 'main'), '', url);
+  }
+  assert.equal(resolveMarkdownImage('logo.png', 'malformed/repo/name', 'main'), '');
+  assert.equal(resolveMarkdownImage('logo.png', 'owner/..', 'main'), '');
+  assert.equal(resolveMarkdownImage('logo.png', 'owner/repo', '../main'), '');
+  assert.equal(resolveMarkdownImage('logo.png', 'owner/repo', 'main?next=evil'), '');
+  assert.equal(resolveMarkdownImage('logo.png'), '');
+  const doc = parseMarkdown([
+    '<img alt="Safe fallback" data-example=" src=./fake.png" srcset="./ignored.png">',
+    '![blocked](https://img.shields.io/tracker.svg)',
+  ].join('\n'), 'a/b', 'main');
+  assert.deepEqual(blocks(doc)[0].runs.filter((run) => run.image).map((run) => [run.text, run.imageUrl]), [
+    ['［图片：Safe fallback］', ''], ['［图片：blocked］', ''],
+  ]);
+});
+
+test('one image budget applies across all pages, including repeated table headers', () => {
+  const table = ['| ![Header](badge.png) |', '| --- |', ...Array(50).fill('| row |')].join('\n');
+  const doc = parseMarkdown(`![Blocked](https://localhost/logo.png)\n\n${table}\n\n![Last](last.png)`, 'a/b', 'main');
+  const runs = blocks(doc).flatMap((block) => [
+    ...block.runs, ...block.headers.flatMap((cell) => cell.runs),
+  ]);
+  assert.equal(runs.filter((run) => run.imageUrl !== '').length, MARKDOWN_IMAGE_LIMIT);
+  assert.ok(runs.some((run) => run.text === '［图片：Header］' && run.imageUrl === ''));
+  assert.equal(runs.at(-1).imageUrl, '');
 });
 
 test('tables preserve alignment, escaped pipes, styled cell labels and repeated headers across chunks', () => {

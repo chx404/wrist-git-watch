@@ -1,9 +1,11 @@
 // A bounded GitHub-flavoured Markdown preview, not an HTML renderer. Only local
-// fragments survive in the model; images, HTML and external links never fetch data.
+// links and, with README context, allowlisted native image sources survive.
 export const MARKDOWN_SOURCE_LIMIT: number = 64000;
 export const MARKDOWN_BLOCK_LIMIT: number = 384;
 export const MARKDOWN_PAGE_BLOCKS: number = 8;
+export const MARKDOWN_IMAGE_LIMIT: number = 12;
 const PAGE_COST: number = 1900;
+const IMAGE_COST: number = 380;
 const LINE_LIMIT: number = 900;
 const CODE_WIDTH: number = 360;
 const CODE_LINES: number = 9;
@@ -32,8 +34,9 @@ export class MarkdownRun {
   image: boolean;
   link: boolean;
   anchor: string;
+  imageUrl: string;
 
-  constructor(text: string, style: number, anchor: string) {
+  constructor(text: string, style: number, anchor: string, imageUrl: string = '') {
     this.text = text;
     this.bold = (style & BOLD) !== 0;
     this.italic = (style & ITALIC) !== 0;
@@ -42,6 +45,7 @@ export class MarkdownRun {
     this.image = (style & IMAGE) !== 0;
     this.link = (style & LINK) !== 0;
     this.anchor = anchor;
+    this.imageUrl = imageUrl;
   }
 }
 
@@ -149,6 +153,130 @@ function fragment(value: string): string {
   }
 }
 
+const IMAGE_SOURCE_LIMIT: number = 1024;
+const RAW_GITHUB: string = 'https://raw.githubusercontent.com/';
+const unsafeImageChars: RegExp = /[\u0000-\u001F\u007F-\u009F\\]/;
+const imageExtension: RegExp = /\.(?:png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i;
+const repositorySlug: RegExp = /^[a-z0-9-]{1,39}\/[a-z0-9._-]{1,100}$/i;
+const attachmentId: string = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
+const attachmentPath: RegExp = new RegExp(`^user-attachments/assets/${attachmentId}$`, 'i');
+const legacyAttachmentPath: RegExp = new RegExp(`^assets/[0-9]+/${attachmentId}$`, 'i');
+
+function validImageRepo(slug: string): boolean {
+  if (!repositorySlug.test(slug)) {
+    return false;
+  }
+  const repo = slug.split('/')[1];
+  return repo !== '.' && repo !== '..';
+}
+
+// Encode segment by segment and reject encoded separators, double encoding and
+// traversal outside the repo. Absolute URLs never get dot-segment rewriting.
+function imagePath(path: string, relative: boolean, encoded: boolean = true): string {
+  const segments: string[] = [];
+  try {
+    for (const raw of path.split('/')) {
+      const segment = encoded ? decodeURIComponent(raw) : raw;
+      if (segment === '' || unsafeImageChars.test(segment) || /[\/%]/.test(segment)) {
+        return '';
+      }
+      if (segment === '.' || segment === '..') {
+        if (!relative || (segment === '..' && segments.length === 0)) {
+          return '';
+        }
+        if (segment === '..') {
+          segments.pop();
+        }
+      } else {
+        segments.push(encodeURIComponent(segment));
+      }
+    }
+  } catch (_) {
+    return '';
+  }
+  return segments.join('/');
+}
+
+function safeRawQuery(query: string): boolean {
+  return query === '' || /^(?:raw(?:=(?:true|1))?|sanitize=true)$/i.test(query);
+}
+
+function rawRepositoryImage(path: string): boolean {
+  const parts = path.split('/');
+  return parts.length >= 4 && validImageRepo(`${parts[0]}/${parts[1]}`) && imageExtension.test(path);
+}
+
+// Only known image-serving GitHub routes are permitted, not general github.com
+// pages, Camo/proxy URLs or external badges/CDNs. Return a reconstructed HTTPS
+// URL; do not pass the README's original authority, credentials or query on.
+export function resolveMarkdownImage(source: string, repoSlug: string = '', repoRef: string = ''): string {
+  if (source.length > IMAGE_SOURCE_LIMIT || unsafeImageChars.test(source)) {
+    return '';
+  }
+  const withoutFragment = source.trim().split('#')[0];
+  const queryAt = withoutFragment.indexOf('?');
+  const path = queryAt < 0 ? withoutFragment : withoutFragment.slice(0, queryAt);
+  const query = queryAt < 0 ? '' : withoutFragment.slice(queryAt + 1);
+  const absolute = /^https:\/\/([a-z0-9.-]+)\/(.+)$/i.exec(path);
+  if (absolute === null) {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith('//') || !safeRawQuery(query) ||
+      !validImageRepo(repoSlug) || repoRef.length > 255 || /[\s~^:?*\[\\]|\.\.|@\{/.test(repoRef)) {
+      return '';
+    }
+    const ref = imagePath(repoRef, false, false);
+    const file = imagePath(path.startsWith('/') ? path.slice(1) : path, true);
+    return ref !== '' && imageExtension.test(file) ? `${RAW_GITHUB}${repoSlug}/${ref}/${file}` : '';
+  }
+  const host = absolute[1].toLowerCase();
+  const file = imagePath(absolute[2], false);
+  if (file === '') {
+    return '';
+  }
+  if (host === 'raw.githubusercontent.com') {
+    return rawRepositoryImage(file) && safeRawQuery(query) ? RAW_GITHUB + file : '';
+  }
+  if (host === 'media.githubusercontent.com') {
+    return file.startsWith('media/') && rawRepositoryImage(file.slice(6)) && safeRawQuery(query)
+      ? `https://${host}/${file}` : '';
+  }
+  if (host === 'user-images.githubusercontent.com') {
+    return /^\d+\/[a-z0-9_.-]+$/i.test(file) && imageExtension.test(file) && query === ''
+      ? `https://${host}/${file}` : '';
+  }
+  if (host === 'avatars.githubusercontent.com') {
+    return /^(?:u\/[0-9]+|[a-z0-9-]{1,39})$/i.test(file) &&
+      (query === '' || /^(?:[sv]=\d{1,4})(?:&[sv]=\d{1,4})?$/.test(query))
+      ? `https://${host}/${file}${query === '' ? '' : '?' + query}` : '';
+  }
+  if (host === 'github.githubassets.com') {
+    return file.startsWith('images/') && imageExtension.test(file) && query === '' ? `https://${host}/${file}` : '';
+  }
+  if (host !== 'github.com') {
+    return '';
+  }
+  if (attachmentPath.test(file) && query === '') {
+    return `https://${host}/${file}`;
+  }
+  const parts = file.split('/');
+  const slug = `${parts[0]}/${parts[1]}`;
+  if (!validImageRepo(slug)) {
+    return '';
+  }
+  const repoPath = parts.slice(2).join('/');
+  if (parts[2] === 'blob' || parts[2] === 'raw') {
+    const raw = `${slug}/${parts.slice(3).join('/')}`;
+    return rawRepositoryImage(raw) && safeRawQuery(query) ? RAW_GITHUB + raw : '';
+  }
+  if (legacyAttachmentPath.test(repoPath) && query === '') {
+    return `https://${host}/${file}`;
+  }
+  if (/^actions\/workflows\/[a-z0-9_.-]+\.ya?ml\/badge\.svg$/i.test(repoPath) &&
+    (query === '' || /^(?:(?:branch|event)=[-a-z0-9._~%/]+)(?:&(?:branch|event)=[-a-z0-9._~%/]+)?$/i.test(query))) {
+    return `https://${host}/${file}${query === '' ? '' : '?' + query}`;
+  }
+  return '';
+}
+
 function labelKey(value: string): string {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -164,7 +292,7 @@ class Destination {
 }
 
 // A destination may contain balanced parentheses, angle brackets or an optional
-// title. We parse it to find the closing delimiter, but keep only local fragments.
+// title. Links keep only local fragments; image targets are filtered separately.
 function destination(text: string, start: number, inline: boolean): Destination | undefined {
   let at = start;
   while (white(char(text, at)) && at < text.length) {
@@ -307,6 +435,25 @@ function emphasisEnd(text: string, start: number, marker: string, size: number):
   return -1;
 }
 
+function htmlImage(tag: string, writer: InlineWriter, style: number, anchor: string): void {
+  const attribute: RegExp = /\s+([^=\s"'<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/y;
+  attribute.lastIndex = 4; // immediately after <img, not inside another attribute's value
+  let alt: string | undefined;
+  let source: string | undefined;
+  let attr = attribute.exec(tag);
+  while (attr !== null) {
+    const name = attr[1].toLowerCase();
+    const value = attr[2] ?? attr[3] ?? attr[4] ?? '';
+    if (name === 'alt' && alt === undefined) {
+      alt = value;
+    } else if (name === 'src' && source === undefined) {
+      source = value;
+    }
+    attr = attribute.exec(tag);
+  }
+  writer.addImage(alt ?? '', decodeEntities(source ?? ''), style, anchor);
+}
+
 class InlineWriter {
   runs: MarkdownRun[] = [];
   limit: number;
@@ -316,12 +463,16 @@ class InlineWriter {
     this.limit = limit;
   }
 
-  add(text: string, style: number, anchor: string): void {
+  addImage(label: string, source: string, style: number, anchor: string): void {
+    this.add(label.length > 0 ? `［图片：${decodeEntities(label)}］` : '［图片］', style | IMAGE, anchor, source);
+  }
+
+  add(text: string, style: number, anchor: string, imageUrl: string = ''): void {
     if (text.length === 0) {
       return;
     }
     const last = this.runs[this.runs.length - 1];
-    if (this.runs.length > 0 && this.previousStyle === style && last.anchor === anchor) {
+    if (this.runs.length > 0 && (style & IMAGE) === 0 && this.previousStyle === style && last.anchor === anchor) {
       last.text += text;
       return;
     }
@@ -331,7 +482,7 @@ class InlineWriter {
       this.previousStyle = 0;
       return;
     }
-    this.runs.push(new MarkdownRun(text, style, anchor));
+    this.runs.push(new MarkdownRun(text, style, anchor, imageUrl));
     this.previousStyle = style;
   }
 }
@@ -400,7 +551,7 @@ function inlineInto(text: string, references: Map<string, string>, writer: Inlin
           writer.add(plain, style, anchor);
           plain = '';
           if (image) {
-            writer.add(label.length > 0 ? `［图片：${decodeEntities(label)}］` : '［图片］', style | IMAGE, anchor);
+            writer.addImage(label, url, style, anchor);
           } else {
             inlineInto(label, references, writer, style | LINK, anchor || fragment(url), depth + 1);
           }
@@ -451,11 +602,9 @@ function inlineInto(text: string, references: Map<string, string>, writer: Inlin
         if (tag === 'br' || tag === '/br') {
           plain += '\n';
         } else if (tag === 'img') {
-          const alt = /\salt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(html[0]);
-          const label = alt !== null ? alt[1] ?? alt[2] ?? alt[3] ?? '' : '';
           writer.add(plain, style, anchor);
           plain = '';
-          writer.add(label.length > 0 ? `［图片：${decodeEntities(label)}］` : '［图片］', style | IMAGE, anchor);
+          htmlImage(html[0], writer, style, anchor);
         }
         at += html[0].length;
         continue;
@@ -717,7 +866,37 @@ function paginate(blocks: MarkdownBlock[], document: MarkdownDocument): void {
   document.pages.push(page);
 }
 
-export function parseMarkdown(source: string): MarkdownDocument {
+function filterImageRuns(runs: MarkdownRun[], repoSlug: string, repoRef: string, remaining: number): number {
+  let accepted = 0;
+  for (const run of runs) {
+    if (run.image) {
+      run.imageUrl = accepted < remaining ? resolveMarkdownImage(run.imageUrl, repoSlug, repoRef) : '';
+      if (run.imageUrl !== '') {
+        accepted++;
+      }
+    }
+  }
+  return accepted;
+}
+
+function filterImages(blocks: MarkdownBlock[], repoSlug: string, repoRef: string): void {
+  let remaining = validImageRepo(repoSlug) && repoRef !== '' ? MARKDOWN_IMAGE_LIMIT : 0;
+  for (const block of blocks) {
+    let accepted = filterImageRuns(block.runs, repoSlug, repoRef, remaining);
+    for (const cell of block.headers) {
+      accepted += filterImageRuns(cell.runs, repoSlug, repoRef, remaining - accepted);
+    }
+    for (const row of block.rows) {
+      for (const cell of row) {
+        accepted += filterImageRuns(cell.runs, repoSlug, repoRef, remaining - accepted);
+      }
+    }
+    block.cost += accepted * IMAGE_COST;
+    remaining -= accepted;
+  }
+}
+
+export function parseMarkdown(source: string, repoSlug: string = '', repoRef: string = ''): MarkdownDocument {
   const document = new MarkdownDocument();
   document.truncated = source.length > MARKDOWN_SOURCE_LIMIT;
   const lines = prefix(source, MARKDOWN_SOURCE_LIMIT).replace(/\r\n?/g, '\n').split('\n');
@@ -818,9 +997,10 @@ export function parseMarkdown(source: string): MarkdownDocument {
               break;
             }
             block = new MarkdownBlock('table');
-            block.headers = headers;
+            // Each visible copy of the header counts separately toward the image limit.
+            block.headers = tableRow(header, alignments.length, references);
             block.alignments = alignments;
-            block.cost = rowCost(headers);
+            block.cost = rowCost(block.headers);
           }
           block.rows.push(row);
           block.cost += cost;
@@ -885,6 +1065,7 @@ export function parseMarkdown(source: string): MarkdownDocument {
     blocks.push(level > 0 ? heading(text, level, used, suffixes, references) : prose('paragraph', text, references));
   }
   document.truncated = document.truncated || index < lines.length;
+  filterImages(blocks, repoSlug, repoRef);
   paginate(blocks, document);
   return document;
 }
