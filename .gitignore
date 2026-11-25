@@ -1,0 +1,11 @@
+node_modules/
+.ohpm/
+oh_modules/
+.hvigor/
+.idea/
+local.properties
+**/build/
+dist/
+*.p12
+*.p7b
+*.cer

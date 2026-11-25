@@ -1,0 +1,7 @@
+{
+  "modelVersion": "6.0.0",
+  "name": "wrist-git-watch",
+  "version": "0.2.0",
+  "description": "原生鸿蒙手表 GitHub 客户端：仓库、通知、收藏、验证码和下载",
+  "dependencies": {}
+}

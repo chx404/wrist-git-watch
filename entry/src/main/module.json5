@@ -1,0 +1,27 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "mainElement": "EntryAbility",
+    "deviceTypes": ["wearable"],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "pages": "$profile:main_pages",
+    "requestPermissions": [{ "name": "ohos.permission.INTERNET" }],
+    "abilities": [{
+      "name": "EntryAbility",
+      "srcEntry": "./ets/entryability/EntryAbility.ets",
+      "label": "$string:ability_label",
+      "icon": "$media:app_icon",
+      "startWindowIcon": "$media:app_icon",
+      "startWindowBackground": "$color:window_background",
+      "exported": true,
+      "skills": [
+        { "entities": ["entity.system.home"], "actions": ["action.system.home"] },
+        { "actions": ["ohos.want.action.sendData"], "uris": [{ "type": "text/plain" }] },
+        { "actions": ["ohos.want.action.viewData"], "entities": ["entity.system.browsable"],
+          "uris": [{ "scheme": "wristgit", "host": "repo" }] }
+      ]
+    }]
+  }
+}
