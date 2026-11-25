@@ -1,27 +1,34 @@
-import { common } from '@kit.AbilityKit';
-import { preferences } from '@kit.ArkData';
-import { curves } from '@kit.ArkUI';
+import type { common } from '@kit.AbilityKit';
+import lazy { preferences } from '@kit.ArkData';
+import lazy { curves } from '@kit.ArkUI';
 import lazy { pasteboard } from '@kit.BasicServicesKit';
-import { Asset, Branch, GitHub, GitHubError, GitHubNotification, IssueComment, IssueOrPullDetail, LanguageSlice, Release, Repo, RepoThread, TreeItem } from '../common/GitHub';
+import lazy { GitHub, GitHubError } from '../common/GitHub';
+import type { Asset, Branch, GitHubNotification, IssueComment, IssueOrPullDetail, LanguageSlice, Release, Repo, RepoThread, TreeItem } from '../common/GitHub';
 import { compact, exactRepo, listQuery, PAGE_SIZE, sizeLabel, textPages } from '../common/Logic';
 import { belongs, FavoriteGroup, groupName, removeFromGroups, setMembership } from '../common/Collection';
-import { Downloads, DownloadSpec, DownloadStatus } from '../common/Downloads';
-import { TotpAccount, Vault } from '../common/Vault';
-import { DockTab, GlassDock } from '../components/GlassDock';
+import lazy { Downloads } from '../common/Downloads';
+import type { DownloadSpec, DownloadStatus } from '../common/Downloads';
+import lazy { Vault } from '../common/Vault';
+import type { TotpAccount } from '../common/Vault';
+import { WatchTab, watchPageProgress } from '../common/WatchPager';
 import { MarkdownView } from '../components/MarkdownView';
 import { WristGuide } from '../components/WristGuide';
 import { DAY_LOOK, Look, NIGHT_LOOK } from '../common/Look';
-import { FloorAction, FloorCopy, floorCopy, opensFloor, pullAccepted, pullDistance } from '../common/QuickFloor';
+import { closesFloor, FloorAction, FloorCopy, floorCopy, floorReveal, floorRise, opensFloor, pullAccepted, pullDistance } from '../common/QuickFloor';
 import { CrownMotion, crownScrollRange } from '../common/CrownMotion';
+import { allowsQuickFloor } from '../common/WristNavigation';
+import { DeviceAuth, DeviceAuthError, DEVICE_CLIENT_ID, DEVICE_SCOPE, DeviceSession } from '../common/DeviceAuth';
+import { encodeQrText, qrPathCommands, QrEcc } from '../common/QrCode';
+import type { QrCode } from '../common/QrCode';
 
 const MAIN_SCROLL_ID: string = 'wrist-main-scroll';
 const FLOOR_SCROLL_ID: string = 'wrist-floor-scroll';
 const FILE_MAX: number = 128 * 1024;
 const DIR_PAGE: number = 12;
 const ROOT_KINDS: string[] = ['home', 'search', 'notifications', 'saved'];
-const ROOT_TABS: DockTab[] = [new DockTab('首页', 'home'), new DockTab('搜索', 'search'), new DockTab('通知', 'notices'), new DockTab('收藏', 'saved')];
+const ROOT_TABS: WatchTab[] = [new WatchTab('首页', 'home'), new WatchTab('搜索', 'search'), new WatchTab('通知', 'notices'), new WatchTab('收藏', 'saved')];
 const REPO_KINDS: string[] = ['repo', 'readme', 'tree', 'releases'];
-const REPO_TABS: DockTab[] = [new DockTab('概览', 'overview'), new DockTab('文档', 'readme'), new DockTab('代码', 'tree'), new DockTab('发布', 'releases')];
+const REPO_TABS: WatchTab[] = [new WatchTab('概览', 'overview'), new WatchTab('文档', 'readme'), new WatchTab('代码', 'tree'), new WatchTab('发布', 'releases')];
 const REPO_TITLES: string[] = ['仓库', 'README', '代码', 'Releases'];
 
 class Screen {
@@ -62,6 +69,8 @@ class Screen {
   watching: boolean = false;
   hasStarsState: boolean = false;
   hasWatchState: boolean = false;
+  userCode: string = '';
+  deviceStatus: string = '';
   constructor(kind: string, title: string) {
     this.kind = kind;
     this.title = title;
@@ -72,13 +81,27 @@ class Screen {
 @Component
 struct Index {
   @State private screen: Screen = new Screen('home', '首页');
+  @State private fullReady: boolean = false;
+  @State private servicesReady: boolean = false;
+  @State private enhanced: boolean = false;
+  @State private pagerProgress: number = 0;
+  @State private qrCell: number = 0;
+  @State private oauthClientDraft: string = '';
+  @State private qrZoom: boolean = false;
+  @State private qrZoomCell: number = 0;
+  @State private bootHint: string = '';
   @State private input: string = '';
   @State private favorites: Repo[] = [];
   @State private saveError: string = '';
   @State private searchEditing: boolean = false;
+  @State private searchInputOpen: boolean = false;
   @State private dark: boolean = false;
   @State private floorOpen: boolean = false;
+  @State private floorVisible: boolean = false;
+  @State private floorProgress: number = 0;
+  @State private floorKind: string = 'home';
   @State private guideOpen: boolean = false;
+  @State private guideHint: boolean = false;
   @State private fingerY: number = 0;
   @State private crownY: number = 0;
   @State private groups: FavoriteGroup[] = [];
@@ -96,7 +119,7 @@ struct Index {
   @State private otpDraft: string = '';
   @State private otpValue: string = '';
   @State private otpRemaining: number = 0;
-  @StorageLink('wristGitShared') @Watch('sharedChanged') private sharedSlug: string = '';
+  private sharedSlug: string = '';
   private authGeneration: number = 0;
   private markTimer: number = -1;
   private otpTimer: number = -1;
@@ -108,27 +131,107 @@ struct Index {
   private roots: Map<string, Screen> = new Map<string, Screen>();
   private prefs: preferences.Preferences | undefined = undefined;
   private serial: number = 0;
-  private scroller: Scroller = new Scroller();
-  private floorScroller: Scroller = new Scroller();
+  private scroller: Scroller | undefined = undefined;
+  private floorScroller: Scroller | undefined = undefined;
+  private rootPager: SwiperController | undefined = undefined;
+  private repoPager: SwiperController | undefined = undefined;
   private viewportHeight: number = 0;
   private contentHeight: number = -1;
   private pullFromTop: boolean = false;
+  private floorPanFromEnd: boolean = false;
+  private floorCloseArmed: boolean = false;
+  private floorTimer: number = -1;
+  private floorEpoch: number = 0;
   private touchDown: boolean = false;
   private focusTicket: number = 0;
   private focusTimer: number = -1;
+  private bootTimer: number = -1;
+  private enhancedTimer: number = -1;
+  private defaultApplied: boolean = false;
+  private deviceSession: DeviceSession | undefined = undefined;
+  private deviceGen: number = 0;
+  private qrSymbol: QrCode | undefined = undefined;
+  private qrCache: string = '';
+  private qrCacheFor: string = '';
+  private initialized: boolean = false;
   private crown: CrownMotion = new CrownMotion((y: number) => {
-    this.scroller.scrollTo({ xOffset: 0, yOffset: y, animation: false });
+    this.scroller?.scrollTo({ xOffset: 0, yOffset: y, animation: false });
   }, (y: number) => { this.crownY = y; }, () => {
     this.getUIContext().animateTo({ curve: curves.springMotion(0.31, 0.74, 0.12) }, () => { this.crownY = 0; });
   });
 
-  private get look(): Look { return this.dark ? NIGHT_LOOK : DAY_LOOK; }
+  private theme(): Look { return this.dark ? NIGHT_LOOK : DAY_LOOK; }
+  private floorTheme(): Look { return this.dark ? DAY_LOOK : NIGHT_LOOK; }
 
   aboutToAppear(): void {
-    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    this.downloads = new Downloads(ctx, (state: DownloadStatus) => { this.download = state; });
-    this.download = this.downloads.status();
+    console.info('WristGitBoot: F10-index-created');
+    // Boot straight into the verified compatible surface; the earlier crash
+    // paths (F10 shell / lite page) are no longer part of startup.
+    this.activateFull();
+  }
+
+  private activateFull(): void {
+    if (this.fullReady) { return; }
+    console.info('WristGitBoot: F11-mount-compatible');
     try {
+      this.scroller = new Scroller();
+      this.floorScroller = new Scroller();
+      this.fullReady = true;
+      this.scheduleServices();
+    } catch (_) {
+      this.bootHint = '无法创建滚动界面 · F11';
+      console.warn('WristGitBoot: F11-scroll-unavailable');
+    }
+  }
+
+  private scheduleServices(): void {
+    if (!this.fullReady || this.initialized || this.bootTimer >= 0) { return; }
+    console.info('WristGitBoot: F20-schedule-services');
+    this.bootHint = '正在读取设置并连接 GitHub…';
+    this.bootTimer = setTimeout(() => { this.bootTimer = -1; this.initServices(); }, 100);
+  }
+
+  private tryEnhanced(): void {
+    if (!this.fullReady) { return; }
+    this.crown.reset();
+    this.touchReset();
+    const enable = !this.enhanced;
+    if (enable) {
+      try {
+        if (this.rootPager === undefined) { this.rootPager = new SwiperController(); }
+        if (this.repoPager === undefined) { this.repoPager = new SwiperController(); }
+      } catch (_) { console.warn('WristGitBoot: swiper-unavailable'); return; }
+    }
+    console.info(enable ? 'WristGitBoot: F30-enable-enhanced' : 'WristGitBoot: F31-disable-enhanced');
+    this.enhanced = enable;
+    if (enable) { this.focusSurface(); }
+  }
+
+  private uiAnimate(duration: number, change: () => void): void {
+    if (!this.enhanced) { change(); return; }
+    let applied = false;
+    try {
+      this.getUIContext().animateTo({ duration, curve: Curve.EaseOut }, () => { applied = true; change(); });
+    } catch (_) { if (!applied) { change(); } }
+  }
+
+  private initServices(): void {
+    if (this.initialized) { return; }
+    this.initialized = true;
+    console.info('WristGitBoot: F21-services-start');
+    let ctx: common.UIAbilityContext | undefined = undefined;
+    try { ctx = this.getUIContext().getHostContext() as common.UIAbilityContext; } catch (_) {}
+    if (ctx === undefined) {
+      try { ctx = getContext(this) as common.UIAbilityContext; } catch (_) {}
+    }
+    if (ctx !== undefined) {
+      try {
+        this.downloads = new Downloads(ctx, (state: DownloadStatus) => { this.download = state; });
+        this.download = this.downloads.status();
+      } catch (_) { console.warn('WristGitBoot: downloads-unavailable'); }
+    }
+    try {
+      if (ctx === undefined) { throw new Error('No ability context'); }
       this.prefs = preferences.getPreferencesSync(ctx, { name: 'wrist_git' });
       const raw = this.prefs.getSync('favorites_v2', '') as string;
       if (raw) {
@@ -140,26 +243,66 @@ struct Index {
         this.favorites = Array.isArray(items) ? items : [];
       }
       this.mirror = this.prefs.getSync('speed_endpoint', '') as string;
+      this.oauthClientDraft = this.prefs.getSync('oauth_client_id', '') as string;
       this.dark = this.prefs.getSync('appearance_dark', false) as boolean;
-      this.guideOpen = !(this.prefs.getSync('guide_03_seen', false) as boolean) && !this.sharedSlug;
+      this.guideHint = !(this.prefs.getSync('guide_03_seen', false) as boolean);
     } catch (_) {
       this.saveError = '无法读取本机设置';
+      this.guideHint = true;
+      console.warn('WristGitBoot: preferences-unavailable');
     }
-    this.restoreAuth();
-    this.load();
+    this.servicesReady = true;
+    this.bootHint = '';
+    console.info('WristGitBoot: F22-services-initialized');
+    this.restoreAuth().catch(() => { console.warn('WristGitBoot: account-unavailable'); });
+    this.consumeShared();
+    this.load().catch(() => { console.warn('WristGitBoot: feed-unavailable'); });
+    this.scheduleDefaultEnhanced();
+    if (this.enhanced) { this.focusSurface(); }
+  }
+
+  private scheduleDefaultEnhanced(): void {
+    if (!this.fullReady || !this.servicesReady || this.defaultApplied || this.enhancedTimer >= 0) { return; }
+    this.enhancedTimer = setTimeout(() => {
+      this.enhancedTimer = -1;
+      this.defaultApplied = true;
+      if (!this.enhanced) { this.tryEnhanced(); }
+    }, 180);
   }
 
   onPageShow(): void {
-    if (this.sharedSlug) { this.sharedChanged(); }
+    if (!this.fullReady) {
+      console.warn('WristGitBoot: F11-mount-failed');
+      this.activateFull();
+      return;
+    }
+    if (this.servicesReady) { this.consumeShared(); this.scheduleDefaultEnhanced(); }
+    else { this.scheduleServices(); }
     if (this.screen.kind === 'otpCode' && !this.floorOpen) { this.startOtpClock(); }
-    this.focusSurface();
+    if (this.enhanced) { this.focusSurface(); }
+  }
+
+  private consumeShared(): void {
+    try {
+      this.sharedSlug = AppStorage.get<string>('wristGitShared') ?? '';
+      if (!this.sharedSlug) { return; }
+      AppStorage.setOrCreate('wristGitShared', '');
+      this.sharedChanged();
+    } catch (_) { console.warn('WristGitBoot: share-unavailable'); }
   }
 
   onPageHide(): void {
+    if (this.bootTimer >= 0) { clearTimeout(this.bootTimer); this.bootTimer = -1; }
+    if (this.enhancedTimer >= 0) { clearTimeout(this.enhancedTimer); this.enhancedTimer = -1; }
     this.cancelFocus();
     this.crown.reset();
     this.touchDown = false;
     this.touchReset();
+    this.clearFloorTimer();
+    this.floorOpen = false;
+    this.floorVisible = false;
+    this.floorProgress = 0;
+    this.floorCloseArmed = false;
     this.tokenDraft = '';
     this.otpDraft = '';
     this.stopOtpClock();
@@ -210,11 +353,120 @@ struct Index {
     }
   }
 
+  private deviceClientId(): string {
+    const custom = this.oauthClientDraft.trim();
+    return /^[A-Za-z0-9]{10,40}$/.test(custom) ? custom : DEVICE_CLIENT_ID;
+  }
+
+  private openDeviceAuth(): void {
+    this.open(new Screen('deviceAuth', '扫码连接'));
+    this.startDeviceAuth();
+  }
+
+  private async startDeviceAuth(): Promise<void> {
+    if (this.screen.kind !== 'deviceAuth' || this.actionBusy) { return; }
+    this.actionBusy = true;
+    const gen = ++this.deviceGen;
+    this.screen.deviceStatus = '正在生成验证码…';
+    this.screen.userCode = '';
+    this.qrSymbol = undefined;
+    this.qrCache = '';
+    this.qrCell = 0;
+    try {
+      const session = await DeviceAuth.start(this.deviceClientId(), DEVICE_SCOPE);
+      if (gen !== this.deviceGen || this.screen.kind !== 'deviceAuth') { return; }
+      this.deviceSession = session;
+      this.screen.userCode = session.userCode;
+      this.qrSymbol = encodeQrText(DeviceAuth.verificationUrl(session.userCode), QrEcc.LOW);
+      this.screen.deviceStatus = '用手机扫码，或在浏览器输入验证码';
+      this.actionBusy = false;
+      this.devicePoll(gen);
+    } catch (e) {
+      if (gen === this.deviceGen && this.screen.kind === 'deviceAuth') {
+        this.screen.deviceStatus = this.message(e as Object, '无法开始扫码连接');
+        this.actionBusy = false;
+      }
+    }
+  }
+
+  private async devicePoll(gen: number): Promise<void> {
+    const session = this.deviceSession;
+    if (session === undefined) { return; }
+    try {
+      const token = await DeviceAuth.poll(session, this.deviceClientId(),
+        () => gen === this.deviceGen && this.screen.kind === 'deviceAuth' && !this.actionBusy,
+        (state: string) => {
+          if (gen === this.deviceGen && this.screen.kind === 'deviceAuth') { this.screen.deviceStatus = state; }
+        });
+      if (gen !== this.deviceGen || this.screen.kind !== 'deviceAuth') { return; }
+      await this.finishDeviceAuth(token);
+    } catch (e) {
+      if (gen === this.deviceGen && this.screen.kind === 'deviceAuth') {
+        this.screen.deviceStatus = this.message(e as Object, '扫码连接失败');
+      }
+    }
+  }
+
+  private async finishDeviceAuth(token: string): Promise<void> {
+    this.actionBusy = true;
+    const gen = this.deviceGen;
+    const serial = this.serial;
+    this.screen.deviceStatus = '授权完成，正在验证账户…';
+    try {
+      const user = await GitHub.validateToken(token);
+      if (gen !== this.deviceGen || serial !== this.serial || this.screen.kind !== 'deviceAuth') { return; }
+      await Vault.saveToken(token);
+      GitHub.setToken(token);
+      const switched = !!this.login && this.login.toLowerCase() !== user.login.toLowerCase();
+      this.login = user.login;
+      this.roots.clear();
+      if (switched) { this.history = []; }
+      try {
+        this.prefs?.putSync('github_login', user.login);
+        await this.prefs?.flush();
+      } catch (_) {}
+      this.screen.deviceStatus = `已连接 · @${user.login}`;
+    } catch (e) {
+      this.screen.deviceStatus = this.message(e as Object, '授权完成但无法保存到手表');
+    } finally { this.actionBusy = false; }
+  }
+
+  private cancelDeviceAuth(): void {
+    this.deviceGen++;
+    this.deviceSession = undefined;
+    this.screen.userCode = '';
+    this.qrSymbol = undefined;
+    this.qrCache = '';
+    this.screen.deviceStatus = '已取消扫码连接';
+  }
+
+  private qrCommands(cell: number): string {
+    const qr = this.qrSymbol;
+    if (qr === undefined || cell <= 0) { return ''; }
+    const key = `${qr.size}-${cell}`;
+    if (this.qrCacheFor !== key) {
+      this.qrCache = qrPathCommands(qr, cell, 2);
+      this.qrCacheFor = key;
+    }
+    return this.qrCache;
+  }
+
+  private qrBoxModules(): number {
+    return this.qrSymbol === undefined ? 1 : this.qrSymbol.size + 8;
+  }
+
+  private async saveOauthClientDraft(): Promise<void> {
+    try {
+      this.prefs?.putSync('oauth_client_id', this.oauthClientDraft.trim());
+      await this.prefs?.flush();
+    } catch (_) {}
+  }
+
   private async authenticate(): Promise<void> {
     if (this.actionBusy || !this.authReady) { return; }
     const token = this.tokenDraft.trim();
     this.tokenDraft = '';
-    this.getUIContext().getFocusController().clearFocus();
+    this.clearKeyboardFocus();
     if (!/^[A-Za-z0-9_]{20,240}$/.test(token)) {
       this.screen.hint = '请输入 GitHub 个人访问令牌';
       return;
@@ -287,9 +539,13 @@ struct Index {
     this.focusTimer = -1;
   }
 
+  private clearKeyboardFocus(): void {
+    try { this.getUIContext().getFocusController().clearFocus(); } catch (_) {}
+  }
+
   private focusSurface(): void {
     this.cancelFocus();
-    if (this.searchEditing || this.guideOpen) { return; }
+    if (!this.enhanced || this.searchEditing || this.guideOpen) { return; }
     const ticket = this.focusTicket;
     const id = this.floorOpen ? FLOOR_SCROLL_ID : MAIN_SCROLL_ID;
     this.focusTimer = setTimeout(() => {
@@ -305,9 +561,9 @@ struct Index {
   }
 
   private onCrown(event: CrownEvent): void {
-    if (this.searchEditing || this.floorOpen || this.guideOpen || this.touchDown || this.pullFromTop) { return; }
+    if (!this.enhanced || this.searchEditing || this.floorOpen || this.guideOpen || this.touchDown || this.pullFromTop) { return; }
     if (![CrownAction.BEGIN, CrownAction.UPDATE, CrownAction.END].includes(event.action)) { return; }
-    const y = this.scroller.currentOffset()?.yOffset;
+    const y = this.scroller?.currentOffset()?.yOffset;
     const limit = crownScrollRange(this.viewportHeight, this.contentHeight);
     if (y === undefined || limit < 0) { return; }
     if (event.degree !== 0) { this.crown.apply(event.degree, y, limit); }
@@ -319,46 +575,114 @@ struct Index {
     if (event.type === TouchType.Down) {
       this.touchDown = true;
       this.crown.reset();
-      const y = this.scroller.currentOffset()?.yOffset ?? Number.POSITIVE_INFINITY;
-      this.pullFromTop = y <= 1 && !this.searchEditing && !this.floorOpen && !this.guideOpen;
+      const y = this.scroller?.currentOffset()?.yOffset ?? Number.POSITIVE_INFINITY;
+      this.pullFromTop = y <= 1 && allowsQuickFloor(this.screen.kind) && !this.searchEditing && !this.floorOpen && !this.guideOpen;
     } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
       this.touchDown = false;
-      if (event.type === TouchType.Cancel) { this.touchReset(); }
+      if (event.type === TouchType.Cancel) { this.touchReset(); this.cancelFloorPreview(); }
     }
   }
 
   private touchReset(): void {
     this.pullFromTop = false;
     if (this.fingerY !== 0) {
-      this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseOut }, () => { this.fingerY = 0; });
+      this.uiAnimate(180, () => { this.fingerY = 0; });
     }
   }
 
+  private clearFloorTimer(): void {
+    this.floorEpoch++;
+    if (this.floorTimer >= 0) { clearTimeout(this.floorTimer); }
+    this.floorTimer = -1;
+  }
+
+  private animateFloor(target: number, duration: number): void {
+    try {
+      this.getUIContext().animateTo({ duration, curve: Curve.EaseOut }, () => { this.floorProgress = target; });
+    } catch (_) { this.floorProgress = target; }
+  }
+
+  private mountFloor(): void {
+    if (this.floorVisible) { return; }
+    this.floorKind = this.screen.kind;
+    this.floorProgress = 0;
+    this.floorVisible = true;
+  }
+
+  private previewFloor(offset: number): void {
+    if (this.floorOpen || this.guideOpen || !allowsQuickFloor(this.screen.kind)) { return; }
+    const progress = floorReveal(offset);
+    if (progress > 0) { this.mountFloor(); }
+    if (this.floorVisible) { this.floorProgress = progress; }
+  }
+
   private setFloor(open: boolean): void {
-    if (this.floorOpen === open || this.guideOpen) { return; }
+    if ((open && (this.floorOpen || !allowsQuickFloor(this.screen.kind))) || (!open && !this.floorVisible) || this.guideOpen) { return; }
+    const wasOpen = this.floorOpen;
+    const fresh = !this.floorVisible;
+    this.clearFloorTimer();
+    const ticket = this.floorEpoch;
     this.crown.reset();
     this.touchReset();
-    this.getUIContext().getFocusController().clearFocus();
-    this.searchEditing = false;
+    this.floorCloseArmed = false;
     if (open) {
+      this.mountFloor();
+      this.clearKeyboardFocus();
+      this.searchEditing = false;
       this.cancelMark();
       if (this.screen.kind === 'otpCode') { this.stopOtpClock(); }
     }
-    this.getUIContext().animateTo({ duration: open ? 240 : 185, curve: Curve.EaseOut }, () => { this.floorOpen = open; });
-    if (!open && this.screen.kind === 'otpCode') { this.startOtpClock(); }
-    this.focusSurface();
+    this.floorOpen = open;
+    if (open && fresh) {
+      // Mount an invisible frame before committing the fade for tap-to-open.
+      this.floorTimer = setTimeout(() => {
+        this.floorTimer = -1;
+        if (ticket === this.floorEpoch) { this.animateFloor(1, 230); }
+      }, 24);
+    } else {
+      this.animateFloor(open ? 1 : 0, open ? 180 : 195);
+    }
+    if (!open) {
+      this.floorTimer = setTimeout(() => {
+        this.floorTimer = -1;
+        if (ticket === this.floorEpoch) { this.floorVisible = false; }
+      }, 210);
+      if (wasOpen && this.screen.kind === 'otpCode') { this.startOtpClock(); }
+    }
+    if (open || wasOpen) { this.focusSurface(); }
+  }
+
+  private cancelFloorPreview(): void {
+    if (this.floorVisible && !this.floorOpen) { this.setFloor(false); }
+  }
+
+  private beginFloorExit(allowed: boolean): void {
+    this.floorCloseArmed = this.floorOpen && allowed;
+  }
+
+  private updateFloorExit(event: GestureEvent): void {
+    if (!this.floorCloseArmed) { return; }
+    this.floorProgress = pullAccepted(true, event.offsetX, -event.offsetY) ? 1 - floorReveal(-event.offsetY) : 1;
+  }
+
+  private finishFloorExit(event?: GestureEvent): void {
+    if (!this.floorCloseArmed) { return; }
+    this.floorCloseArmed = false;
+    if (event !== undefined && closesFloor(true, event.offsetX, event.offsetY)) { this.setFloor(false); }
+    else { this.animateFloor(1, 160); }
   }
 
   private showGuide(): void {
     if (this.floorOpen) { this.setFloor(false); }
     this.cancelFocus();
     this.crown.reset();
-    this.getUIContext().getFocusController().clearFocus();
+    this.clearKeyboardFocus();
     this.guideOpen = true;
   }
 
   private finishGuide(tryFloor: boolean): void {
     this.guideOpen = false;
+    this.guideHint = false;
     try {
       this.prefs?.putSync('guide_03_seen', true);
       this.prefs?.flush().catch(() => {});
@@ -368,7 +692,7 @@ struct Index {
 
   private appearance(dark: boolean): void {
     if (this.dark === dark) { return; }
-    this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseOut }, () => { this.dark = dark; });
+    this.uiAnimate(180, () => { this.dark = dark; });
     try {
       this.prefs?.putSync('appearance_dark', dark);
       this.prefs?.flush().catch(() => {});
@@ -379,7 +703,7 @@ struct Index {
     const ticket = this.serial;
     setTimeout(() => {
       if (ticket === this.serial) {
-        this.scroller.scrollTo({ xOffset: 0, yOffset: offset, animation: false });
+        this.scroller?.scrollTo({ xOffset: 0, yOffset: offset, animation: false });
       }
     }, 40);
   }
@@ -390,15 +714,19 @@ struct Index {
     this.crown.reset();
     this.touchReset();
     this.pendingAction = '';
+    this.deviceGen++;
+    this.deviceSession = undefined;
+    this.qrZoom = false;
     this.tokenDraft = '';
     this.otpDraft = '';
     this.searchEditing = false;
+    this.searchInputOpen = false;
     this.stopOtpClock();
     this.cancelMark();
   }
 
   private open(next: Screen): void {
-    this.screen.offset = this.scroller.currentOffset()?.yOffset ?? 0;
+    this.screen.offset = this.scroller?.currentOffset()?.yOffset ?? 0;
     this.history.push(this.screen);
     this.swap(next);
   }
@@ -406,7 +734,7 @@ struct Index {
   private swap(next: Screen, keepFloor: boolean = false): void {
     this.leave(keepFloor);
     this.serial++;
-    this.getUIContext().animateTo({ duration: 240, curve: Curve.EaseOut }, () => { this.screen = next; });
+    this.uiAnimate(240, () => { this.screen = next; });
     this.load();
     this.scrollToOffset(0);
     if (next.kind === 'otpCode' && !this.floorOpen) { this.startOtpClock(); }
@@ -424,7 +752,7 @@ struct Index {
     }
     this.leave();
     this.serial++;
-    this.getUIContext().animateTo({ duration: 265, curve: Curve.EaseOut }, () => { this.screen = prior; });
+    this.uiAnimate(265, () => { this.screen = prior; });
     if (this.screen.kind === 'otpCode') { this.startOtpClock(); }
     if (this.screen.kind === 'group') { this.groupDraft = this.screen.query; }
     if (this.screen.busy) { this.screen.busy = false; }
@@ -437,10 +765,10 @@ struct Index {
   private root(index: number): void {
     const kind = ROOT_KINDS[index];
     if (!kind || this.screen.kind === kind) { return; }
-    this.getUIContext().getFocusController().clearFocus();
+    this.clearKeyboardFocus();
     this.searchEditing = false;
     if (ROOT_KINDS.includes(this.screen.kind)) {
-      this.screen.offset = this.scroller.currentOffset()?.yOffset ?? 0;
+      this.screen.offset = this.scroller?.currentOffset()?.yOffset ?? 0;
       this.screen.busy = false;
       this.roots.set(this.screen.kind, this.screen);
     }
@@ -465,6 +793,7 @@ struct Index {
         return;
       }
       this.sharedSlug = text;
+      this.sharedChanged();
     } catch (_) {
       if (serial === this.serial) { this.screen.hint = '无法读取本次复制内容，可在输入框中粘贴'; }
     }
@@ -476,8 +805,9 @@ struct Index {
       this.screen.hint = '请输入关键词或仓库名';
       return;
     }
-    this.getUIContext().getFocusController().clearFocus();
+    this.clearKeyboardFocus();
     this.searchEditing = false;
+    this.searchInputOpen = false;
     this.focusSurface();
     const slug = exactRepo(q);
     if (slug) {
@@ -1035,7 +1365,7 @@ struct Index {
     if (this.actionBusy) { return; }
     const seed = this.otpDraft.trim();
     this.otpDraft = '';
-    this.getUIContext().getFocusController().clearFocus();
+    this.clearKeyboardFocus();
     if (!seed) { this.screen.hint = '请输入 Base32 密钥或 otpauth 链接'; return; }
     this.actionBusy = true;
     const serial = this.serial;
@@ -1110,20 +1440,20 @@ struct Index {
   pill(label: string, selected: boolean, action: () => void) {
     Button(label, { type: ButtonType.Capsule })
       .fontSize(12).fontWeight(FontWeight.Medium)
-      .fontColor(selected ? this.look.accentText : this.look.blue).backgroundColor(selected ? this.look.blue : this.look.pale)
+      .fontColor(selected ? this.theme().accentText : this.theme().blue).backgroundColor(selected ? this.theme().blue : this.theme().pale)
       .height(34).padding({ left: 8, right: 8 }).layoutWeight(1)
       .onClick(action)
   }
 
   @Builder
   actionButton(label: string, enabled: boolean, action: () => void) {
-    Button(label, { type: ButtonType.Capsule }).fontSize(12).fontColor(this.look.blue).backgroundColor(this.look.pale)
+    Button(label, { type: ButtonType.Capsule }).fontSize(12).fontColor(this.theme().blue).backgroundColor(this.theme().pale)
       .width('91%').height(35).enabled(enabled).onClick(action)
   }
 
   @Builder
   quiet(message: string) {
-    Text(message).fontSize(12).fontColor(this.look.muted).lineHeight(18).textAlign(TextAlign.Center)
+    Text(message).fontSize(12).fontColor(this.theme().muted).lineHeight(18).textAlign(TextAlign.Center)
       .width('100%').padding({ top: 9, bottom: 9, left: 8, right: 8 })
   }
 
@@ -1132,30 +1462,38 @@ struct Index {
     if (this.screen.kind === 'home') {
       Column({ space: 8 }) {
         Row({ space: 6 }) {
-          Blank().width(13).height(2).borderRadius(1).backgroundColor(this.look.blue)
-          Text('WRIST / GIT').fontSize(9).fontWeight(FontWeight.Bold).letterSpacing(1.5).fontColor(this.look.blue)
+          Blank().width(13).height(2).borderRadius(1).backgroundColor(this.theme().blue)
+          Text('WRIST / GIT').fontSize(9).fontWeight(FontWeight.Bold).letterSpacing(1.5).fontColor(this.theme().blue)
         }.width('100%')
         Row({ space: 5 }) {
-          Text('腕上 Git').fontSize(27).fontWeight(FontWeight.Bold).letterSpacing(-0.9).fontColor(this.look.ink)
+          Text('腕上 Git').fontSize(27).fontWeight(FontWeight.Bold).letterSpacing(-0.9).fontColor(this.theme().ink)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
           Stack() {
-            Circle().width(32).height(32).fill('#F5F8FC')
-            Image($r('app.media.github_invertocat')).width(19).height(19).objectFit(ImageFit.Contain)
+            if (this.enhanced) {
+              Circle().width(32).height(32).fill('#F5F8FC')
+              Image($r('app.media.github_invertocat')).width(19).height(19).objectFit(ImageFit.Contain)
+            } else {
+              Text('Git').fontSize(10).fontWeight(FontWeight.Bold).fontColor(this.theme().blue)
+            }
           }.width(32).height(32).focusable(true).accessibilityText('GitHub 集成 · 打开腕上 Git 项目')
             .onClick(() => { this.openGitHub('https://github.com/chx404/wrist-git-watch'); })
         }.width('100%').alignItems(VerticalAlign.Center)
-        Text('用一块表，逛开源。').fontSize(11).fontColor(this.look.muted).width('100%')
+        Text('用一块表，逛开源。').fontSize(11).fontColor(this.theme().muted).width('100%')
+        if (this.guideHint) {
+          Button('新手指南 ›', { type: ButtonType.Capsule }).height(27).fontSize(11)
+            .fontColor(this.theme().blue).backgroundColor(this.theme().pale).onClick(() => this.showGuide())
+        }
       }.width('75%').alignItems(HorizontalAlign.Start).padding({ top: 3, bottom: 3 })
     } else {
       if (!ROOT_KINDS.includes(this.screen.kind)) {
         Button('‹ 返回', { type: ButtonType.Capsule })
-          .fontSize(12).fontColor(this.look.blue).backgroundColor(this.look.pale).height(32)
+          .fontSize(12).fontColor(this.theme().blue).backgroundColor(this.theme().pale).height(32)
           .padding({ left: 14, right: 14 }).onClick(() => { this.back(); })
       }
-      Text(this.screen.title).fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.look.ink).maxLines(1)
+      Text(this.screen.title).fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.theme().ink).maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Center).width('72%')
       if (this.screen.slug && this.screen.kind !== 'file') {
-        Text(this.screen.slug).fontSize(11).fontColor(this.look.muted).maxLines(1)
+        Text(this.screen.slug).fontSize(11).fontColor(this.theme().muted).maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis }).textAlign(TextAlign.Center).width('78%')
       }
     }
@@ -1165,54 +1503,54 @@ struct Index {
   repoCard(repo: Repo) {
     Row({ space: 8 }) {
       Text(repo.name.slice(0, 1).toUpperCase()).width(24).height(24)
-        .textAlign(TextAlign.Center).fontColor(this.look.blue).backgroundColor(this.look.pale).borderRadius(7)
+        .textAlign(TextAlign.Center).fontColor(this.theme().blue).backgroundColor(this.theme().pale).borderRadius(7)
         .fontSize(12).fontWeight(FontWeight.Bold)
       Column({ space: 3 }) {
-        Text(repo.full_name).fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.look.ink)
+        Text(repo.full_name).fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.theme().ink)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
         if (repo.description) {
-          Text(repo.description).fontSize(11).lineHeight(15).fontColor(this.look.muted)
+          Text(repo.description).fontSize(11).lineHeight(15).fontColor(this.theme().muted)
             .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
         }
         Text(`★ ${compact(repo.stargazers_count)}${repo.language ? '  ·  ' + repo.language : ''}`)
-          .fontSize(10).fontColor(this.look.blue).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+          .fontSize(10).fontColor(this.theme().blue).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-      Text('›').fontSize(16).fontColor(this.look.muted)
+      Text('›').fontSize(16).fontColor(this.theme().muted)
     }
     .width('100%').constraintSize({ minHeight: 53 }).padding({ left: 8, right: 8, top: 7, bottom: 7 })
-    .alignItems(VerticalAlign.Center).backgroundColor(this.look.card).borderRadius(13).border({ width: 1, color: this.look.border })
+    .alignItems(VerticalAlign.Center).backgroundColor(this.theme().card).borderRadius(13).border({ width: 1, color: this.theme().border })
     .focusable(true).onClick(() => this.openRepo(repo.full_name, repo))
   }
 
   @Builder
   repoSummary(repo: Repo) {
     Column({ space: 8 }) {
-      Text(repo.name).fontSize(17).fontWeight(FontWeight.Bold).fontColor(this.look.ink).wordBreak(WordBreak.BREAK_ALL)
-      Text(repo.description || '此仓库没有说明').fontSize(12).lineHeight(18).fontColor(this.look.muted)
+      Text(repo.name).fontSize(17).fontWeight(FontWeight.Bold).fontColor(this.theme().ink).wordBreak(WordBreak.BREAK_ALL)
+      Text(repo.description || '此仓库没有说明').fontSize(12).lineHeight(18).fontColor(this.theme().muted)
       Text(`★ ${compact(repo.stargazers_count)}   ·   Fork ${compact(repo.forks_count)}`)
-        .fontSize(12).fontColor(this.look.blue).fontWeight(FontWeight.Medium)
+        .fontSize(12).fontColor(this.theme().blue).fontWeight(FontWeight.Medium)
       Text(`Issues / PR ${compact(repo.open_issues_count)}  ·  ${repo.default_branch}`)
-        .fontSize(11).fontColor(this.look.muted).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        .fontSize(11).fontColor(this.theme().muted).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
       if (this.screen.language.length > 0) {
         Row() {
           ForEach(this.screen.language, (item: LanguageSlice, index: number) => {
-            Row().width(`${item.share}%`).height(5).backgroundColor(this.look.chart[index])
+            Row().width(`${item.share}%`).height(5).backgroundColor(this.theme().chart[index])
           }, (item: LanguageSlice) => item.name)
         }.width('100%').borderRadius(3).clip(true)
         Flex({ wrap: FlexWrap.Wrap }) {
           ForEach(this.screen.language, (item: LanguageSlice, index: number) => {
-            Text(`● ${item.name} ${Math.round(item.share)}%`).fontSize(10).fontColor(this.look.chart[index])
+            Text(`● ${item.name} ${Math.round(item.share)}%`).fontSize(10).fontColor(this.theme().chart[index])
               .margin({ right: 8, bottom: 3 })
           }, (item: LanguageSlice) => item.name)
         }.width('100%')
       } else if (repo.language) {
-        Text(repo.language).fontSize(11).fontColor(this.look.muted)
+        Text(repo.language).fontSize(11).fontColor(this.theme().muted)
       }
-    }.alignItems(HorizontalAlign.Start).width('100%').padding(11).backgroundColor(this.look.card)
-      .borderRadius(15).border({ width: 1, color: this.look.border })
+    }.alignItems(HorizontalAlign.Start).width('100%').padding(11).backgroundColor(this.theme().card)
+      .borderRadius(15).border({ width: 1, color: this.theme().border })
     if (!repo.private) {
       Button(this.isSaved(repo.full_name) ? '★ 已收藏 · 点击取消' : '☆ 收藏到手表', { type: ButtonType.Capsule })
-        .fontSize(12).fontColor(this.look.blue).backgroundColor(this.look.pale).height(36).width('88%')
+        .fontSize(12).fontColor(this.theme().blue).backgroundColor(this.theme().pale).height(36).width('88%')
         .enabled(!this.actionBusy).onClick(() => { this.toggleSave(repo); })
       this.actionButton('加入收藏分组', !this.actionBusy, () => this.showGroups(repo))
     }
@@ -1245,19 +1583,44 @@ struct Index {
     if (this.saveError) { this.quiet(this.saveError) }
   }
 
+  private openSearchInput(): void {
+    if (this.screen.kind !== 'search' || this.floorOpen || this.guideOpen) { return; }
+    this.searchInputOpen = true;
+    this.cancelFocus();
+    const ticket = this.serial;
+    setTimeout(() => {
+      if (ticket !== this.serial || !this.searchInputOpen || this.touchDown || this.floorOpen) { return; }
+      try { this.getUIContext().getFocusController().requestFocus('wrist-repo-input'); } catch (_) {}
+    }, 75);
+  }
+
   @Builder
   searchBox() {
     Column({ space: 7 }) {
-      TextInput({ placeholder: '关键词 / owner/repo', text: this.input })
-        .id('wrist-repo-input').width('100%').height(37).fontSize(13).fontColor(this.look.ink).placeholderColor(this.look.muted)
-        .backgroundColor(this.look.card).borderRadius(18).border({ width: 1, color: this.look.border })
-        .maxLength(250).enterKeyType(EnterKeyType.Search)
-        .onChange((value: string) => { this.input = value; }).onSubmit(() => this.submit())
-        .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
-      Button('搜索仓库', { type: ButtonType.Capsule }).fontSize(12).fontColor(this.look.accentText).height(35)
-        .width('85%').backgroundColor(this.look.blue).onClick(() => this.submit())
+      if (this.searchInputOpen) {
+        TextInput({ placeholder: '关键词 / owner/repo', text: this.input })
+          .id('wrist-repo-input').width('100%').height(36).fontSize(13).fontColor(this.theme().ink).placeholderColor(this.theme().muted)
+          .backgroundColor(this.theme().card).borderRadius(18).border({ width: 1, color: this.theme().border })
+          .maxLength(250).enterKeyType(EnterKeyType.Search).focusOnTouch(false)
+          .onChange((value: string) => { this.input = value; }).onSubmit(() => this.submit())
+          .onClick(() => this.openSearchInput())
+          .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
+        Row({ space: 5 }) {
+          this.pill('搜索', true, () => this.submit())
+          this.pill('收起', false, () => {
+            this.clearKeyboardFocus();
+            this.searchInputOpen = false;
+            this.editorFocus(false);
+            this.focusSurface();
+          })
+        }.width('100%')
+      } else {
+        Button(this.input ? `编辑：${this.input}` : '输入关键词或仓库名 ›', { type: ButtonType.Capsule })
+          .fontSize(12).fontColor(this.theme().blue).height(32).width('90%').backgroundColor(this.theme().pale)
+          .onClick(() => this.openSearchInput())
+      }
       PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
-        .fontSize(12).width('85%').height(33).backgroundColor(this.look.pale).fontColor(this.look.blue)
+        .fontSize(12).width('85%').height(33).backgroundColor(this.theme().pale).fontColor(this.theme().blue)
         .onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
           if (result === PasteButtonOnClickResult.SUCCESS) { this.pasteRepository(); }
           else { this.screen.hint = '系统没有授权这次粘贴，可在输入框中手动输入'; }
@@ -1267,31 +1630,92 @@ struct Index {
   }
 
   @Builder
+  qrZoomOverlay() {
+    Stack() {
+      Column() {
+        if (this.qrZoomCell > 0 && this.qrSymbol !== undefined) {
+          Path({ width: this.qrBoxModules() * this.qrZoomCell, height: this.qrBoxModules() * this.qrZoomCell,
+            commands: this.qrCommands(this.qrZoomCell) }).fill('#000000')
+        }
+        Text('点按收起').fontSize(11).fontColor('#000000').margin({ top: 10 })
+      }.width('100%').height('100%').justifyContent(FlexAlign.Center)
+    }.width('100%').height('100%').backgroundColor('#FFFFFF')
+      .padding(12).clip(true)
+      .onClick(() => { this.qrZoom = false; this.qrZoomCell = 0; })
+      .onAreaChange((_old: Area, next: Area) => {
+        const edge = Math.min(Number(next.width), Number(next.height));
+        const modules = this.qrBoxModules();
+        if (Number.isFinite(edge) && edge > 24 && modules > 1) {
+          const cell = Math.max(1, Math.floor((edge - 24) / modules));
+          if (cell !== this.qrZoomCell) { this.qrZoomCell = cell; }
+        }
+      })
+  }
+
+  @Builder
+  deviceAuthBody() {
+    if (this.screen.deviceStatus) { this.quiet(this.screen.deviceStatus) }
+    if (this.screen.userCode) {
+      Text('验证码').fontSize(10).fontColor(this.theme().muted)
+      Text(this.screen.userCode).fontSize(25).fontWeight(FontWeight.Bold).letterSpacing(2)
+        .fontFamily('monospace').fontColor(this.theme().ink).copyOption(CopyOptions.LocalDevice)
+      Stack() {
+        Column().width('100%').height('100%').backgroundColor('#FFFFFF')
+        if (this.qrCell > 0 && this.qrSymbol !== undefined) {
+          Path({ width: this.qrBoxModules() * this.qrCell, height: this.qrBoxModules() * this.qrCell,
+            commands: this.qrCommands(this.qrCell) }).fill('#000000')
+        }
+      }.width('96%').aspectRatio(1).borderRadius(10).clip(true).backgroundColor('#FFFFFF').padding(8)
+        .onClick(() => { if (this.qrSymbol !== undefined) { this.qrZoom = true; } })
+        .onAreaChange((_old: Area, next: Area) => {
+          const width = Number(next.width);
+          const modules = this.qrBoxModules();
+          if (Number.isFinite(width) && width > 8 && modules > 1) {
+            const cell = Math.max(1, Math.floor((width - 16) / modules));
+            if (cell !== this.qrCell) { this.qrCell = cell; }
+          }
+        })
+      Text('用手机扫一扫，在手机上点「授权」').fontSize(11).fontColor(this.theme().muted).textAlign(TextAlign.Center)
+      Text('点按二维码可全屏放大').fontSize(10).fontColor(this.theme().muted).textAlign(TextAlign.Center)
+      Text(DeviceAuth.verificationUrl(this.screen.userCode)).fontSize(9).fontColor(this.theme().blue)
+        .copyOption(CopyOptions.LocalDevice).width('90%').textAlign(TextAlign.Center)
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    if (!this.screen.userCode && !this.screen.deviceStatus.includes('失败') && !this.screen.deviceStatus.includes('取消') &&
+      !this.screen.deviceStatus.includes('过期')) {
+      this.quiet('即将显示二维码和验证码')
+    }
+    this.actionButton('重新生成验证码', !this.actionBusy && this.screen.deviceStatus !== '', () => this.startDeviceAuth())
+    this.actionButton('取消扫码连接', true, () => this.cancelDeviceAuth())
+    this.quiet('验证码和二维码不含任何令牌；令牌只在授权完成后由 GitHub 发给手表。')
+  }
+
+  @Builder
   rowCard(badge: string, name: string, note: string, action: () => void) {
     Row({ space: 8 }) {
-      Text(badge).width(21).fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.look.blue).textAlign(TextAlign.Center)
+      Text(badge).width(21).fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.theme().blue).textAlign(TextAlign.Center)
       Column({ space: 3 }) {
-        Text(name).fontSize(13).fontColor(this.look.ink).fontWeight(FontWeight.Medium)
+        Text(name).fontSize(13).fontColor(this.theme().ink).fontWeight(FontWeight.Medium)
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
         if (note) {
-          Text(note).fontSize(10).fontColor(this.look.muted).maxLines(1)
+          Text(note).fontSize(10).fontColor(this.theme().muted).maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
         }
       }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-      Text('›').fontSize(15).fontColor(this.look.muted)
+      Text('›').fontSize(15).fontColor(this.theme().muted)
     }.width('100%').constraintSize({ minHeight: 42 }).padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(this.look.card).borderRadius(12).border({ width: 1, color: this.look.border }).focusable(true).onClick(action)
+      .backgroundColor(this.theme().card).borderRadius(12).border({ width: 1, color: this.theme().border }).focusable(true).onClick(action)
   }
 
   @Builder
   pageControl(count: number) {
     if (count > 1) {
       Row({ space: 5 }) {
-        Button('‹', { type: ButtonType.Capsule }).width(38).height(33).fontSize(15).fontColor(this.look.blue)
-          .backgroundColor(this.look.pale).enabled(this.screen.page > 1).onClick(() => this.jump(this.screen.page - 1))
-        Text(`${this.screen.page} / ${count}`).fontSize(11).fontColor(this.look.muted).layoutWeight(1).textAlign(TextAlign.Center)
-        Button('›', { type: ButtonType.Capsule }).width(38).height(33).fontSize(15).fontColor(this.look.blue)
-          .backgroundColor(this.look.pale).enabled(this.screen.page < count).onClick(() => this.jump(this.screen.page + 1))
+        Button('‹', { type: ButtonType.Capsule }).width(38).height(33).fontSize(15).fontColor(this.theme().blue)
+          .backgroundColor(this.theme().pale).enabled(this.screen.page > 1).onClick(() => this.jump(this.screen.page - 1))
+        Text(`${this.screen.page} / ${count}`).fontSize(11).fontColor(this.theme().muted).layoutWeight(1).textAlign(TextAlign.Center)
+        Button('›', { type: ButtonType.Capsule }).width(38).height(33).fontSize(15).fontColor(this.theme().blue)
+          .backgroundColor(this.theme().pale).enabled(this.screen.page < count).onClick(() => this.jump(this.screen.page + 1))
       }.width('87%')
     }
   }
@@ -1304,8 +1728,8 @@ struct Index {
         const ui = this.getUIContext();
         const info = ui.getComponentUtils().getRectangleById(`markdown-anchor-${anchor}`);
         if (info.size.height > 0) {
-          const current = this.scroller.currentOffset()?.yOffset ?? 0;
-          this.scroller.scrollTo({ xOffset: 0, yOffset: Math.max(0, current + ui.px2vp(info.windowOffset.y) - 45), animation: false });
+          const current = this.scroller?.currentOffset()?.yOffset ?? 0;
+          this.scroller?.scrollTo({ xOffset: 0, yOffset: Math.max(0, current + ui.px2vp(info.windowOffset.y) - 45), animation: false });
           return;
         }
       } catch (_) {}
@@ -1326,12 +1750,20 @@ struct Index {
   settingsBody() {
     this.quiet(this.authReady ? (this.login ? `GitHub · @${this.login}` : 'GitHub · 游客模式') : '正在读取本机安全存储')
     TextInput({ placeholder: 'GitHub 个人访问令牌', text: this.tokenDraft })
-      .width('100%').height(37).fontSize(12).fontColor(this.look.ink).placeholderColor(this.look.muted).backgroundColor(this.look.card)
+      .width('100%').height(37).fontSize(12).fontColor(this.theme().ink).placeholderColor(this.theme().muted).backgroundColor(this.theme().card)
       .type(InputType.Password).showPasswordIcon(false).enableAutoFill(false).maxLength(240)
       .onChange((value: string) => { this.tokenDraft = value; })
       .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false)).onSubmit(() => { this.authenticate(); })
     this.actionButton(this.login ? '验证并更新令牌' : '验证并连接 GitHub', this.authReady && !this.actionBusy, () => { this.authenticate(); })
     this.quiet('通知通常需要 classic 令牌的 notifications 权限；私库或账户操作按需授权。令牌不上传到第三方。')
+    this.actionButton('扫码连接 GitHub（推荐）', !this.actionBusy, () => this.openDeviceAuth())
+    TextInput({ placeholder: '自定义 OAuth Client ID（可选）', text: this.oauthClientDraft })
+      .width('100%').height(35).fontSize(12).fontColor(this.theme().ink).placeholderColor(this.theme().muted)
+      .backgroundColor(this.theme().card).maxLength(40).enableAutoFill(false)
+      .onChange((value: string) => { this.oauthClientDraft = value; })
+      .onFocus(() => this.editorFocus(true))
+      .onBlur(() => { this.editorFocus(false); this.saveOauthClientDraft(); })
+    this.quiet('扫码连接默认使用 GitHub CLI 的公开 Client ID；可注册自己的 OAuth 应用后在这里填写。')
     if (this.login) {
       if (this.pendingAction === 'disconnect') {
         this.actionButton('确认移除本机令牌', !this.actionBusy, () => { this.disconnect(); })
@@ -1346,7 +1778,8 @@ struct Index {
     this.actionButton('下载任务', true, () => this.prepareTransfer())
     this.themePills()
     this.actionButton('重看新手教程', true, () => this.showGuide())
-    this.quiet('腕上 Git 0.3 · 非官方 GitHub 客户端')
+    this.actionButton(this.enhanced ? '关闭横滑分页与自定义表冠' : '启用横滑分页与表冠 · F30', true, () => this.tryEnhanced())
+    this.quiet('腕上 Git 0.3.11 · 完整版')
   }
 
   @Builder
@@ -1354,7 +1787,7 @@ struct Index {
     this.actionButton('测速 · GitHub 官方', !this.actionBusy, () => { this.testSpeed(false); })
     this.quiet('也可以手动测试公开 HTTPS 下载源；不附带账号、令牌或仓库数据。')
     TextInput({ placeholder: 'https:// 下载测试地址', text: this.mirrorDraft })
-      .width('100%').height(37).fontSize(12).fontColor(this.look.ink).placeholderColor(this.look.muted).backgroundColor(this.look.card)
+      .width('100%').height(37).fontSize(12).fontColor(this.theme().ink).placeholderColor(this.theme().muted).backgroundColor(this.theme().card)
       .maxLength(240).enableAutoFill(false).onChange((value: string) => { this.mirrorDraft = value; })
       .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
     this.actionButton('测速 · 这个地址', !this.actionBusy, () => { this.testSpeed(true); })
@@ -1374,11 +1807,11 @@ struct Index {
       })
     } else if (this.screen.kind === 'otpAdd') {
       TextInput({ placeholder: '账户名（URI 可省略）', text: this.otpTitle })
-        .width('100%').height(35).fontSize(12).backgroundColor(this.look.card).fontColor(this.look.ink).maxLength(48)
+        .width('100%').height(35).fontSize(12).backgroundColor(this.theme().card).fontColor(this.theme().ink).maxLength(48)
         .onChange((value: string) => { this.otpTitle = value; })
       .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
       TextInput({ placeholder: 'Base32 密钥或 otpauth', text: this.otpDraft })
-        .width('100%').height(36).fontSize(12).backgroundColor(this.look.card).fontColor(this.look.ink)
+        .width('100%').height(36).fontSize(12).backgroundColor(this.theme().card).fontColor(this.theme().ink)
         .maxLength(512).type(InputType.Password).showPasswordIcon(false).enableAutoFill(false)
         .onChange((value: string) => { this.otpDraft = value; })
       .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
@@ -1386,7 +1819,7 @@ struct Index {
       this.quiet('建议为手表设置锁屏密码。')
     } else {
       Text(this.otpValue || '— — —').fontFamily('monospace').fontSize(27).letterSpacing(2)
-        .fontColor(this.look.blue).fontWeight(FontWeight.Bold).privacySensitive(true).copyOption(CopyOptions.None)
+        .fontColor(this.theme().blue).fontWeight(FontWeight.Bold).privacySensitive(true).copyOption(CopyOptions.None)
       if (this.otpRemaining > 0) { this.quiet(`剩余 ${this.otpRemaining} 秒`) }
       if (this.pendingAction === 'removeOtp') {
         this.actionButton('确认删除本机密钥', !this.actionBusy, () => { this.removeOtp(); })
@@ -1403,10 +1836,10 @@ struct Index {
       if (this.download.message) { this.quiet(this.download.message) }
       if (['starting', 'downloading', 'paused', 'cancelling'].includes(this.download.phase)) {
         Text(`${sizeLabel(this.download.receivedBytes)}${this.download.totalBytes >= 0 ? ' / ' + sizeLabel(this.download.totalBytes) : ''}`)
-          .fontSize(13).fontColor(this.look.blue).fontWeight(FontWeight.Medium)
+          .fontSize(13).fontColor(this.theme().blue).fontWeight(FontWeight.Medium)
         if (this.download.totalBytes > 0) {
           Progress({ value: this.download.receivedBytes, total: this.download.totalBytes, type: ProgressType.Linear })
-            .width('86%').color(this.look.blue)
+            .width('86%').color(this.theme().blue)
         }
         if (this.download.phase === 'downloading') { this.actionButton('暂停', true, () => { this.transferAction('pause'); }) }
         if (this.download.phase === 'paused') { this.actionButton('继续', true, () => { this.transferAction('resume'); }) }
@@ -1436,14 +1869,14 @@ struct Index {
         this.pageControl(this.screen.parts.length)
         if (this.screen.tab === 0) {
           Text(this.screen.parts[this.screen.page - 1]).fontSize(11).lineHeight(17).fontFamily('monospace')
-            .fontColor(this.look.ink).wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
-            .width('100%').padding(10).backgroundColor(this.look.card).borderRadius(13).border({ width: 1, color: this.look.border })
+            .fontColor(this.theme().ink).wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.LocalDevice)
+            .width('100%').padding(10).backgroundColor(this.theme().card).borderRadius(13).border({ width: 1, color: this.theme().border })
         } else {
           Scroll() {
             Text(this.screen.parts[this.screen.page - 1]).fontSize(11).lineHeight(17).fontFamily('monospace')
-              .fontColor(this.look.ink).copyOption(CopyOptions.LocalDevice).padding(10)
+              .fontColor(this.theme().ink).copyOption(CopyOptions.LocalDevice).padding(10)
           }.scrollable(ScrollDirection.Horizontal).width('100%').align(Alignment.TopStart)
-            .backgroundColor(this.look.card).borderRadius(13).border({ width: 1, color: this.look.border })
+            .backgroundColor(this.theme().card).borderRadius(13).border({ width: 1, color: this.theme().border })
         }
         this.pageControl(this.screen.parts.length)
       }
@@ -1451,7 +1884,7 @@ struct Index {
       if (this.screen.markdown || this.screen.loaded) { this.formatted(this.screen.markdown) }
     } else if (this.screen.kind === 'release' && this.screen.release !== undefined) {
       Text(this.screen.release.name || this.screen.release.tag_name).fontSize(16).fontWeight(FontWeight.Bold)
-        .fontColor(this.look.ink).width('100%').wordBreak(WordBreak.BREAK_ALL)
+        .fontColor(this.theme().ink).width('100%').wordBreak(WordBreak.BREAK_ALL)
       this.quiet(`${this.screen.release.published_at?.slice(0, 10) ?? ''}${this.screen.release.prerelease ? ' · 预发布' : ''}`)
       if (this.screen.release.assets.length > 0) {
         this.actionButton(`附件 · ${this.screen.release.assets.length} 个`, true, () => {
@@ -1536,11 +1969,11 @@ struct Index {
       })
     }
     if (this.screen.release !== undefined) {
-      Text(this.screen.release.name || this.screen.release.tag_name).fontSize(16).fontWeight(FontWeight.Bold).fontColor(this.look.ink)
+      Text(this.screen.release.name || this.screen.release.tag_name).fontSize(16).fontWeight(FontWeight.Bold).fontColor(this.theme().ink)
         .width('100%').wordBreak(WordBreak.BREAK_ALL)
       this.formatted(this.screen.markdown)
     } else if (this.screen.issue !== undefined) {
-      Text(this.screen.issue.title).fontSize(16).fontWeight(FontWeight.Bold).fontColor(this.look.ink)
+      Text(this.screen.issue.title).fontSize(16).fontWeight(FontWeight.Bold).fontColor(this.theme().ink)
         .width('100%').wordBreak(WordBreak.BREAK_ALL)
       this.quiet(`#${this.screen.issue.number} · @${this.screen.issue.login} · ${this.screen.issue.merged ? '已合并' : this.screen.issue.state}`)
       if (this.screen.markdown) { this.formatted(this.screen.markdown) }
@@ -1574,7 +2007,7 @@ struct Index {
       if (!this.groups.length) { this.quiet('还没有分组。') }
     }
     TextInput({ placeholder: this.screen.kind === 'group' ? '新的分组名' : '新建分组名称', text: this.groupDraft })
-      .width('100%').height(35).fontSize(12).fontColor(this.look.ink).backgroundColor(this.look.card).maxLength(24)
+      .width('100%').height(35).fontSize(12).fontColor(this.theme().ink).backgroundColor(this.theme().card).maxLength(24)
       .onChange((value: string) => { this.groupDraft = value; })
       .onFocus(() => this.editorFocus(true)).onBlur(() => this.editorFocus(false))
     this.actionButton(this.screen.kind === 'group' ? '保存分组名' : '新建分组', !this.actionBusy, () => {
@@ -1599,14 +2032,14 @@ struct Index {
   @Builder
   linksBody() {
     this.quiet('GitHub 仓库地址')
-    Text(`https://github.com/${this.screen.slug}`).fontSize(12).fontColor(this.look.blue).wordBreak(WordBreak.BREAK_ALL)
+    Text(`https://github.com/${this.screen.slug}`).fontSize(12).fontColor(this.theme().blue).wordBreak(WordBreak.BREAK_ALL)
       .copyOption(CopyOptions.LocalDevice).width('100%')
     this.quiet('Git Clone（长按可复制）')
-    Text(`https://github.com/${this.screen.slug}.git`).fontSize(12).fontColor(this.look.ink).wordBreak(WordBreak.BREAK_ALL)
+    Text(`https://github.com/${this.screen.slug}.git`).fontSize(12).fontColor(this.theme().ink).wordBreak(WordBreak.BREAK_ALL)
       .copyOption(CopyOptions.LocalDevice).width('100%')
     if (this.screen.repo?.homepage) {
       this.quiet('项目主页')
-      Text(this.screen.repo?.homepage ?? '').fontSize(12).fontColor(this.look.ink).wordBreak(WordBreak.BREAK_ALL)
+      Text(this.screen.repo?.homepage ?? '').fontSize(12).fontColor(this.theme().ink).wordBreak(WordBreak.BREAK_ALL)
         .copyOption(CopyOptions.LocalDevice).width('100%')
     }
     this.actionButton('在 GitHub 查看', true, () => { this.openGitHub(`https://github.com/${this.screen.slug}`); })
@@ -1617,9 +2050,9 @@ struct Index {
     if (this.screen.kind === 'home') {
       Row({ space: 5 }) {
         Text(this.screen.tab === 0 ? '探索' : this.screen.tab === 1 ? (this.screen.month ? '本月榜单' : '本周榜单') : '最新')
-          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.look.ink)
+          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(this.theme().ink)
         Blank().layoutWeight(1)
-        Text(this.screen.tab === 1 ? '总星数' : '最近更新').fontSize(10).fontColor(this.look.muted)
+        Text(this.screen.tab === 1 ? '总星数' : '最近更新').fontSize(10).fontColor(this.theme().muted)
       }.width('100%').padding({ left: 4, right: 4, top: 5, bottom: 4 })
     }
     if (this.screen.kind === 'search') { this.searchBox() }
@@ -1639,6 +2072,7 @@ struct Index {
       })
     }
     if (this.screen.kind === 'settings') { this.settingsBody() }
+    if (this.screen.kind === 'deviceAuth') { this.deviceAuthBody() }
     if (this.screen.kind === 'speed') { this.speedBody() }
     if (this.screen.kind === 'transfer') { this.transferBody() }
     if (['otp', 'otpAdd', 'otpCode'].includes(this.screen.kind)) { this.otpBody() }
@@ -1686,8 +2120,8 @@ struct Index {
       if (this.screen.path) {
         this.quiet(`${this.screen.ref} · ${this.screen.path}`)
       } else {
-        Button(`⑂ ${this.screen.ref} · 切换分支`, { type: ButtonType.Capsule }).fontSize(11).fontColor(this.look.blue)
-          .backgroundColor(this.look.pale).width('90%').height(34).onClick(() => this.open(this.fromRepo('branches', '分支')))
+        Button(`⑂ ${this.screen.ref} · 切换分支`, { type: ButtonType.Capsule }).fontSize(11).fontColor(this.theme().blue)
+          .backgroundColor(this.theme().pale).width('90%').height(34).onClick(() => this.open(this.fromRepo('branches', '分支')))
       }
       if (!this.screen.path && this.screen.repo !== undefined && !this.screen.repo.private) {
         this.actionButton('下载当前分支 ZIP', true, () => {
@@ -1710,14 +2144,14 @@ struct Index {
     }
     if (this.screen.hint && this.screen.kind !== 'notifications') { this.quiet(this.screen.hint) }
     if (this.screen.busy) {
-      LoadingProgress().width(24).height(24).color(this.look.blue).margin({ top: 7 })
+      LoadingProgress().width(24).height(24).color(this.theme().blue).margin({ top: 7 })
       this.quiet('正在加载')
     } else if (this.screen.error) {
       this.quiet(this.screen.error)
-      Button('重试', { type: ButtonType.Capsule }).fontSize(12).fontColor(this.look.blue).backgroundColor(this.look.pale)
+      Button('重试', { type: ButtonType.Capsule }).fontSize(12).fontColor(this.theme().blue).backgroundColor(this.theme().pale)
         .width('70%').height(34).onClick(() => this.load(this.screen.loaded))
     } else if (this.screen.more) {
-      Button('加载更多', { type: ButtonType.Capsule }).fontSize(12).fontColor(this.look.blue).backgroundColor(this.look.pale)
+      Button('加载更多', { type: ButtonType.Capsule }).fontSize(12).fontColor(this.theme().blue).backgroundColor(this.theme().pale)
         .width('78%').height(34).onClick(() => this.load(true))
     }
   }
@@ -1741,20 +2175,15 @@ struct Index {
     if (id === 'guide') { this.showGuide(); return; }
     this.setFloor(false);
     if (id === 'top' || id === 'bottom') {
-      this.scroller.scrollEdge(id === 'top' ? Edge.Top : Edge.Bottom);
+      this.scroller?.scrollEdge(id === 'top' ? Edge.Top : Edge.Bottom);
     } else if (id === 'back') { this.back(); }
     else if (id === 'refresh') { this.refresh(); }
     else if (id === 'search') { this.root(1); }
     else if (id === 'saved') { this.root(3); }
     else if (id === 'settings') { this.open(new Screen('settings', '连接与设置')); }
     else if (id === 'input') {
-      this.cancelFocus();
       const serial = this.serial;
-      setTimeout(() => {
-        if (serial === this.serial && !this.floorOpen && !this.guideOpen) {
-          try { this.getUIContext().getFocusController().requestFocus('wrist-repo-input'); } catch (_) {}
-        }
-      }, 200);
+      setTimeout(() => { if (serial === this.serial) { this.openSearchInput(); } }, 220);
     } else if (id === 'clearSearch') {
       this.input = '';
       this.swap(new Screen('search', '搜索'));
@@ -1797,6 +2226,7 @@ struct Index {
       this.otpTitle = '';
       this.open(new Screen('otpAdd', '添加验证码'));
     } else if (id === 'otpRefresh') { this.fetchOtp(); }
+    else if (id === 'deviceRegen') { this.startDeviceAuth(); }
     else if (id === 'acceptShared') {
       const next = new Screen('repo', '仓库');
       next.slug = this.screen.slug;
@@ -1808,8 +2238,8 @@ struct Index {
   floorCue() {
     Button({ type: ButtonType.Capsule }) {
       Column({ space: 2 }) {
-        Blank().width(19).height(2).backgroundColor(this.look.blue).borderRadius(1)
-        Text('⌄').height(9).fontSize(13).fontColor(this.look.blue).textAlign(TextAlign.Center)
+        Blank().width(19).height(2).backgroundColor(this.theme().blue).borderRadius(1)
+        Text('⌄').height(9).fontSize(13).fontColor(this.theme().blue).textAlign(TextAlign.Center)
       }.justifyContent(FlexAlign.Center).width('100%')
     }.width(45).height(22).padding(0).backgroundColor(Color.Transparent).accessibilityText('打开快捷面板，也可以在页首向下滑')
       .onClick(() => this.setFloor(true))
@@ -1824,41 +2254,88 @@ struct Index {
   }
 
   @Builder
+  floorPill(label: string, selected: boolean, action: () => void) {
+    Button(label, { type: ButtonType.Capsule }).layoutWeight(1).height(33).fontSize(12).padding(3)
+      .fontColor(selected ? this.floorTheme().accentText : this.floorTheme().blue)
+      .backgroundColor(selected ? this.floorTheme().blue : this.floorTheme().pale).onClick(action)
+  }
+
+  @Builder
+  floorRow(item: FloorAction) {
+    Row({ space: 8 }) {
+      Text(item.symbol).width(20).fontSize(12).fontColor(this.floorTheme().blue).textAlign(TextAlign.Center)
+      Text(item.id === 'transferState' ? this.transferFloorLabel() : item.title).fontSize(12).layoutWeight(1)
+        .fontColor(this.floorTheme().ink).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text('›').fontSize(14).fontColor(this.floorTheme().muted)
+    }.width('100%').height(37).padding({ left: 8, right: 8 }).borderRadius(11)
+      .backgroundColor(this.floorTheme().card).border({ width: 1, color: this.floorTheme().border })
+      .focusable(this.floorOpen).onClick(() => this.handleFloor(item.id))
+  }
+
+  @Builder
   floorDrawer(copy: FloorCopy) {
     Scroll(this.floorScroller) {
       Column({ space: 7 }) {
-        Button('⌃ 返回页面', { type: ButtonType.Capsule }).height(29).fontSize(11).padding({ left: 12, right: 12 })
-          .fontColor(this.look.blue).backgroundColor(this.look.pale).onClick(() => this.setFloor(false))
         Column({ space: 4 }) {
-          Text('负一屏   /   QUICK TOOLS').fontSize(8).fontWeight(FontWeight.Bold).letterSpacing(0.8).fontColor(this.look.blue)
-          Text(copy.title).fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.look.ink).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(copy.note).fontSize(11).lineHeight(16).fontColor(this.look.muted).width('100%')
-        }.width('100%').alignItems(HorizontalAlign.Start).padding({ top: 3, bottom: 4 })
-        if (this.screen.kind === 'home') {
+          Text('负一屏   /   QUICK TOOLS').fontSize(8).fontWeight(FontWeight.Bold).letterSpacing(0.8).fontColor(this.floorTheme().blue)
+          Text(copy.title).fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.floorTheme().ink)
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(copy.note).fontSize(11).lineHeight(16).fontColor(this.floorTheme().muted).width('87%').textAlign(TextAlign.Center)
+        }.width('100%').alignItems(HorizontalAlign.Center).padding({ top: 1, bottom: 4 })
+        if (this.floorKind === 'home') {
           Row({ space: 4 }) {
-            this.pill('探索', this.screen.tab === 0, () => this.home(0, this.screen.month))
-            this.pill('榜单', this.screen.tab === 1, () => this.home(1, this.screen.month))
-            this.pill('最新', this.screen.tab === 2, () => this.home(2, this.screen.month))
+            this.floorPill('探索', this.screen.tab === 0, () => this.home(0, this.screen.month))
+            this.floorPill('榜单', this.screen.tab === 1, () => this.home(1, this.screen.month))
+            this.floorPill('最新', this.screen.tab === 2, () => this.home(2, this.screen.month))
           }.width('100%')
           if (this.screen.tab === 1) {
             Row({ space: 5 }) {
-              this.pill('本周', !this.screen.month, () => this.home(1, false))
-              this.pill('本月', this.screen.month, () => this.home(1, true))
+              this.floorPill('本周', !this.screen.month, () => this.home(1, false))
+              this.floorPill('本月', this.screen.month, () => this.home(1, true))
             }.width('100%')
           }
         }
         ForEach(copy.actions, (item: FloorAction) => {
-          if (this.floorActionEnabled(item.id)) {
-            this.rowCard(item.symbol, item.id === 'transferState' ? this.transferFloorLabel() : item.title, '', () => this.handleFloor(item.id))
-          }
+          if (this.floorActionEnabled(item.id)) { this.floorRow(item) }
         }, (item: FloorAction) => item.id)
-        Text('外观').width('100%').fontSize(10).fontWeight(FontWeight.Bold).fontColor(this.look.muted).margin({ top: 4 })
-        this.themePills()
-      }.width('76%').padding({ top: 24, bottom: 38 })
+        Text('主页面外观').width('100%').fontSize(10).fontWeight(FontWeight.Bold).fontColor(this.floorTheme().muted).margin({ top: 4 })
+        Row({ space: 5 }) {
+          this.floorPill('浅色', !this.dark, () => this.appearance(false))
+          this.floorPill('黑色', this.dark, () => this.appearance(true))
+        }.width('100%')
+      }.width('74%').padding({ top: 20, bottom: 33 })
     }.id(FLOOR_SCROLL_ID).width('100%').height('100%').scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
-      .focusable(true).defaultFocus(true).digitalCrownSensitivity(CrownSensitivity.MEDIUM)
-      .linearGradient({ angle: 164, colors: [[this.look.glow, 0], [this.look.bg, 0.62], [this.look.low, 1]] })
-      .transition(TransitionEffect.OPACITY.combine(TransitionEffect.translate({ y: -36 })))
+      .focusable(this.floorOpen).defaultFocus(this.floorOpen).digitalCrownSensitivity(CrownSensitivity.MEDIUM)
+      .onTouch((event: TouchEvent) => {
+        if (event.type === TouchType.Down) {
+          try { this.floorPanFromEnd = this.floorScroller?.isAtEnd() ?? false; } catch (_) { this.floorPanFromEnd = false; }
+        }
+      })
+      .parallelGesture(PanGesture({ direction: PanDirection.Vertical, distance: 7 })
+        .onActionStart(() => this.beginFloorExit(this.floorPanFromEnd))
+        .onActionUpdate((event: GestureEvent) => this.updateFloorExit(event))
+        .onActionEnd((event: GestureEvent) => this.finishFloorExit(event))
+        .onActionCancel(() => this.finishFloorExit()))
+  }
+
+  @Builder
+  floorOverlay() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      this.floorDrawer(floorCopy(this.floorKind))
+      Column({ space: 1 }) {
+        Text('⌃').fontSize(9).height(9).fontWeight(FontWeight.Bold).fontColor(this.floorTheme().muted)
+        Blank().width(23).height(2).borderRadius(1).backgroundColor(this.floorTheme().blue)
+      }.width(65).height(26).margin({ bottom: 4 }).justifyContent(FlexAlign.End)
+        .padding({ bottom: 3 }).backgroundColor(Color.Transparent).accessibilityText('从这里向上滑动返回页面')
+        .gesture(PanGesture({ direction: PanDirection.Vertical, distance: 5 })
+          .onActionStart(() => this.beginFloorExit(true))
+          .onActionUpdate((event: GestureEvent) => this.updateFloorExit(event))
+          .onActionEnd((event: GestureEvent) => this.finishFloorExit(event))
+          .onActionCancel(() => this.finishFloorExit()))
+    }.width('100%').height('100%')
+      .linearGradient({ angle: 164, colors: [[this.floorTheme().glow, 0], [this.floorTheme().bg, 0.62], [this.floorTheme().low, 1]] })
+      .opacity(this.floorProgress).translate({ y: floorRise(this.floorProgress) })
+      .hitTestBehavior(this.floorOpen ? HitTestMode.Default : HitTestMode.None)
   }
 
   private transferFloorLabel(): string {
@@ -1873,50 +2350,202 @@ struct Index {
     else { this.root(index); }
   }
 
-  build() {
-    Stack({ alignContent: Alignment.Bottom }) {
-      Scroll(this.scroller) {
-        Column({ space: 7 }) {
-          this.floorCue()
-          this.header()
-          Column({ space: 7 }) { this.body() }.width('80%')
-        }.width('100%').padding({ top: '9%', bottom: ROOT_KINDS.includes(this.screen.kind) || this.usesRepoDock() ? 58 : 46 })
-          .translate({ y: this.crownY + this.fingerY })
-          .onAreaChange((_previous: Area, next: Area) => {
-            const h = Number(next.height);
-            if (Number.isFinite(h) && h >= 0 && h !== this.contentHeight) { this.contentHeight = h; this.crown.reset(); }
-          })
-      }.id(MAIN_SCROLL_ID).width('100%').height('100%').scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
-        .focusable(!this.floorOpen && !this.guideOpen).defaultFocus(true)
+  @Builder
+  shell() {
+    Column({ space: 8 }) {
+      Text('腕上 Git').fontSize(22).fontWeight(FontWeight.Bold).fontColor('#F5F8FF')
+      Text('未能打开完整界面').fontSize(12).fontColor('#A8C9F7')
+      Button('重试').fontSize(12).height(32).width('68%')
+        .backgroundColor('#1B304F').fontColor('#A8C9F7').onClick(() => this.activateFull())
+      if (this.bootHint) { Text(this.bootHint).fontSize(11).fontColor('#C4D3E6').width('75%').textAlign(TextAlign.Center) }
+    }.width('100%').height('100%').justifyContent(FlexAlign.Center).backgroundColor('#0D1117')
+  }
+
+  @Builder
+  fullContents() {
+    if (allowsQuickFloor(this.screen.kind)) { this.floorCue() }
+    this.header()
+    Column({ space: 7 }) {
+      if (this.screen.kind === 'home' && !this.servicesReady) {
+        this.actionButton('读取本机数据并联网 · F20', !this.bootHint, () => this.scheduleServices())
+        Text(this.bootHint || '兼容界面已打开 · F11').fontSize(10).fontColor(this.theme().muted).textAlign(TextAlign.Center)
+      }
+      this.body()
+    }.width(this.screen.kind === 'deviceAuth' ? '92%' : '80%')
+  }
+
+  @Builder
+  compatibleScroll() {
+    Scroll(this.scroller) {
+      Column({ space: 7 }) { this.fullContents() }.width('100%').padding({ top: 25, bottom: 68 })
+    }.width('100%').height('100%').scrollBar(BarState.Off)
+  }
+
+  @Builder
+  nativeScroll(inPager: boolean) {
+    Scroll(this.scroller) {
+      Column({ space: 7 }) { this.fullContents() }
+        .width('100%').padding({ top: '9%', bottom: inPager ? 31 : 46 })
+        .translate({ y: this.crownY + this.fingerY })
         .onAreaChange((_previous: Area, next: Area) => {
           const h = Number(next.height);
-          if (Number.isFinite(h) && h > 0 && h !== this.viewportHeight) { this.viewportHeight = h; this.crown.reset(); }
+          if (Number.isFinite(h) && h >= 0 && h !== this.contentHeight) { this.contentHeight = h; this.crown.reset(); }
         })
-        .onBlur(() => this.crown.reset())
-        .onDigitalCrown((event: CrownEvent) => this.onCrown(event))
-        .onTouch((event: TouchEvent) => this.beginTouch(event))
-        .parallelGesture(PanGesture({ direction: PanDirection.Vertical, distance: 7 })
-          .onActionUpdate((event: GestureEvent) => {
-            if (pullAccepted(this.pullFromTop, event.offsetX, event.offsetY)) {
-              this.fingerY = pullDistance(event.offsetY);
-            } else if (this.fingerY > 0) { this.fingerY = 0; }
-          })
-          .onActionEnd((event: GestureEvent) => {
-            if (opensFloor(this.pullFromTop, event.offsetX, event.offsetY)) { this.setFloor(true); }
-            else { this.touchReset(); }
-          }).onActionCancel(() => this.touchReset()))
-      if (!this.floorOpen && !this.guideOpen && !this.searchEditing && (ROOT_KINDS.includes(this.screen.kind) || this.usesRepoDock())) {
-        GlassDock({ tabs: this.usesRepoDock() ? REPO_TABS : ROOT_TABS,
-          selected: this.usesRepoDock() ? REPO_KINDS.indexOf(this.screen.kind) : ROOT_KINDS.indexOf(this.screen.kind),
-          dark: this.dark, onSelect: (index: number) => this.dockSelect(index) })
-          .width('62%').height(46).margin({ bottom: 5 })
-          .transition(TransitionEffect.OPACITY.combine(TransitionEffect.translate({ y: 11 })))
-      }
-      if (this.floorOpen) { this.floorDrawer(floorCopy(this.screen.kind)) }
-      if (this.guideOpen) { WristGuide({ dark: this.dark, onFinish: (tryFloor: boolean) => this.finishGuide(tryFloor) }) }
-    }.width('100%').height('100%').clip(true)
-      .linearGradient({ angle: 158, colors: [[this.look.glow, 0], [this.look.bg, 0.55], [this.look.low, 1]] })
+    }.id(MAIN_SCROLL_ID).width('100%').height('100%').scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
+      .focusable(!this.floorOpen && !this.guideOpen).defaultFocus(true)
+      .onAreaChange((_previous: Area, next: Area) => {
+        const h = Number(next.height);
+        if (Number.isFinite(h) && h > 0 && h !== this.viewportHeight) { this.viewportHeight = h; this.crown.reset(); }
+      })
+      .onBlur(() => this.crown.reset())
+      .onDigitalCrown((event: CrownEvent) => this.onCrown(event))
+      .onTouch((event: TouchEvent) => this.beginTouch(event))
+      .parallelGesture(PanGesture({ direction: PanDirection.Vertical, distance: 7 })
+        .onActionUpdate((event: GestureEvent) => {
+          if (pullAccepted(this.pullFromTop, event.offsetX, event.offsetY)) {
+            this.fingerY = pullDistance(event.offsetY);
+            this.previewFloor(event.offsetY);
+          } else if (this.fingerY > 0) { this.fingerY = 0; this.previewFloor(0); }
+        })
+        .onActionEnd((event: GestureEvent) => {
+          if (opensFloor(this.pullFromTop, event.offsetX, event.offsetY)) { this.setFloor(true); }
+          else { this.touchReset(); this.cancelFloorPreview(); }
+        }).onActionCancel(() => { this.touchReset(); this.cancelFloorPreview(); }))
   }
+
+  private pagerIndex(group: number): number {
+    return Math.max(0, (group === 1 ? ROOT_KINDS : REPO_KINDS).indexOf(this.screen.kind));
+  }
+
+  private pagerGroup(): number {
+    return ROOT_KINDS.includes(this.screen.kind) ? 1 : this.usesRepoDock() ? 2 : 0;
+  }
+
+  private pagerCommit(group: number, index: number): void {
+    if (group !== this.pagerGroup() || index < 0 || index >= ROOT_KINDS.length || index === this.pagerIndex(group)) { return; }
+    this.dockSelect(index);
+  }
+
+  private pagerTap(group: number, index: number): void {
+    if (group !== this.pagerGroup() || index === this.pagerIndex(group) || this.searchEditing || this.floorVisible || this.guideOpen) { return; }
+    try {
+      const controller = group === 1 ? this.rootPager : this.repoPager;
+      if (controller !== undefined) { controller.changeIndex(index, true); }
+      else { this.pagerCommit(group, index); }
+    } catch (_) { this.pagerCommit(group, index); }
+  }
+
+  private cachedSlugs(index: number): Repo[] {
+    return (index === 3 ? this.favorites : this.roots.get(ROOT_KINDS[index])?.repos ?? []).slice(0, 3);
+  }
+
+  @Builder
+  pagerPreview(group: number, tab: WatchTab, index: number) {
+    // The focused page retains the real Scroll and input. Adjacent pages render
+    // a non-focusable preview while Swiper is in transit, never a second editor.
+    Column({ space: 9 }) {
+      Text(tab.title).fontSize(20).fontWeight(FontWeight.Bold).fontColor(this.theme().ink)
+      if (group === 2) {
+        Text(this.screen.slug).fontSize(11).fontColor(this.theme().muted).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+      } else if (this.cachedSlugs(index).length > 0) {
+        ForEach(this.cachedSlugs(index), (repo: Repo) => {
+          Text(repo.full_name).fontSize(11).fontColor(this.theme().ink).textAlign(TextAlign.Center)
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).width('77%').padding(8)
+            .borderRadius(9).backgroundColor(this.theme().card)
+        }, (repo: Repo) => `${repo.id}`)
+      } else {
+        Text(index === 0 ? '腕上 Git' : index === 1 ? '输入关键词或仓库名' : index === 2 ? 'GitHub 通知' : '本机收藏')
+          .fontSize(11).fontColor(this.theme().muted)
+      }
+    }.width('100%').height('100%').padding({ top: 50 })
+      .hitTestBehavior(HitTestMode.None).accessibilityLevel('no-hide-descendants')
+  }
+
+  @Builder
+  pageRail(group: number, tabs: WatchTab[]) {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Row() {
+        ForEach(tabs, (tab: WatchTab, index: number) => {
+          Row() {
+            Text('').width(4).height(4).borderRadius(2).backgroundColor(this.dark ? '#626262' : '#A5ABB4')
+          }.width(10).height(14).justifyContent(FlexAlign.Center)
+            .accessibilityText(tab.title).onClick(() => this.pagerTap(group, index))
+        }, (tab: WatchTab) => tab.key)
+      }.height(14).padding({ left: 2, right: 2 })
+      Row().width(10).height(4).borderRadius(2).backgroundColor(this.dark ? '#FFFFFF' : this.theme().ink)
+        .position({ x: 2, y: 5 }).translate({ x: this.pagerProgress * 10, y: 0 })
+        .hitTestBehavior(HitTestMode.None).accessibilityLevel('no')
+    }.width(tabs.length * 10 + 4).height(14)
+  }
+
+  @Builder
+  nativePager(group: number, tabs: WatchTab[]) {
+    Column() {
+      Swiper(group === 1 ? this.rootPager : this.repoPager) {
+        ForEach(tabs, (tab: WatchTab, index: number) => {
+          Column() {
+            if (this.pagerIndex(group) === index) { this.nativeScroll(true) }
+            else { this.pagerPreview(group, tab, index) }
+          }.width('100%').height('100%')
+        }, (tab: WatchTab) => tab.key)
+      }.index(this.pagerIndex(group)).indicator(false).loop(false).cachedCount(1)
+        .disableSwipe(this.searchEditing || this.guideOpen || this.floorVisible)
+        .onAppear(() => { this.pagerProgress = this.pagerIndex(group); })
+        .onContentDidScroll((_selectedIndex: number, index: number, position: number, _mainAxisLength: number) => {
+          if (this.pagerGroup() === group) { this.pagerProgress = watchPageProgress(index, position, tabs.length); }
+        })
+        .onChange((index: number) => this.pagerCommit(group, index))
+        .onAnimationEnd((index: number, _event: SwiperAnimationEvent) => {
+          if (group === this.pagerGroup()) {
+            this.pagerCommit(group, index);
+            this.pagerProgress = this.pagerIndex(group);
+            this.focusSurface();
+          }
+        })
+        .layoutWeight(1).width('100%')
+      if (!this.searchEditing) {
+        Row() { this.pageRail(group, tabs) }
+          .width('100%').height(14).justifyContent(FlexAlign.Center).margin({ top: 1, bottom: 2 })
+      }
+    }.width('100%').height('100%')
+  }
+
+  @Builder
+  simpleDock(tabs: WatchTab[], active: number) {
+    Row({ space: 2 }) {
+      ForEach(tabs, (tab: WatchTab, i: number) => {
+        Button(tab.title).layoutWeight(1).height(27).fontSize(10).padding(0)
+          .fontColor(i === active ? this.theme().accentText : this.theme().blue)
+          .backgroundColor(i === active ? this.theme().blue : this.theme().pale)
+          .onClick(() => this.dockSelect(i))
+      }, (tab: WatchTab) => tab.key)
+    }.width('70%').margin({ bottom: 25 }).backgroundColor(this.theme().card).borderRadius(16).padding(3)
+  }
+
+  build() {
+    if (!this.fullReady) {
+      this.shell()
+    } else {
+      Stack({ alignContent: Alignment.Bottom }) {
+        if (this.enhanced && ROOT_KINDS.includes(this.screen.kind)) {
+          this.nativePager(1, ROOT_TABS)
+        } else if (this.enhanced && this.usesRepoDock()) {
+          this.nativePager(2, REPO_TABS)
+        } else if (this.enhanced) {
+          this.nativeScroll(false)
+        } else {
+          this.compatibleScroll()
+          if (!this.floorOpen && !this.guideOpen && !this.searchEditing && this.pagerGroup() !== 0) {
+            this.simpleDock(this.usesRepoDock() ? REPO_TABS : ROOT_TABS, this.pagerIndex(this.pagerGroup()))
+          }
+        }
+        if (this.floorVisible) { this.floorOverlay() }
+        if (this.guideOpen) { WristGuide({ dark: this.dark, onFinish: (tryFloor: boolean) => this.finishGuide(tryFloor) }) }
+        if (this.screen.kind === 'deviceAuth' && this.qrZoom) { this.qrZoomOverlay() }
+      }.width('100%').height('100%').backgroundColor(this.theme().bg)
+    }
+  }
+
 }
 
 interface SavedCollection {

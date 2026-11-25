@@ -1,5 +1,5 @@
-import { socket } from '@kit.NetworkKit';
-import { cert } from '@kit.DeviceCertificateKit';
+import lazy { socket } from '@kit.NetworkKit';
+import lazy { cert } from '@kit.DeviceCertificateKit';
 
 const API_HOST: string = 'api.github.com';
 const MAX_HEADER_BYTES: number = 32 * 1024;

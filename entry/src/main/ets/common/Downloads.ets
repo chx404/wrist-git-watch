@@ -1,6 +1,6 @@
-import { common } from '@kit.AbilityKit';
-import { request } from '@kit.BasicServicesKit';
-import { fileIo as fs } from '@kit.CoreFileKit';
+import type { common } from '@kit.AbilityKit';
+import lazy { request } from '@kit.BasicServicesKit';
+import lazy { fileIo as fs } from '@kit.CoreFileKit';
 
 export const DOWNLOAD_MAX_BYTES: number = 32 * 1024 * 1024;
 const SPEED_BYTES: number = 256 * 1024;

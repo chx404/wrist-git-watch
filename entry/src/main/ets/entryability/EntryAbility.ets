@@ -5,7 +5,7 @@ import { exactRepo } from '../common/Logic';
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, _params: AbilityConstant.LaunchParam): void {
-    AppStorage.setOrCreate('wristGitShared', '');
+    console.info('WristGitBoot: ability-created');
     this.acceptLink(want);
   }
 
@@ -22,10 +22,12 @@ export default class EntryAbility extends UIAbility {
   }
 
   onWindowStageCreate(stage: window.WindowStage): void {
-    stage.loadContent('pages/Index', (err: BusinessError) => {
-      if (err.code) {
-        console.error(`WristGit loadContent failed: ${err.code}`);
-      }
-    });
+    console.info('WristGitBoot: window-stage');
+    try {
+      stage.loadContent('pages/Index', (err: BusinessError) => {
+        if (!err || !err.code) { console.info('WristGitBoot: content-loaded'); return; }
+        console.error(`WristGitBoot: loadContent failed ${err.code}`);
+      });
+    } catch (_) { console.error('WristGitBoot: loadContent failed LOAD-START'); }
   }
 }

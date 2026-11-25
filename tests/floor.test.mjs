@@ -8,7 +8,7 @@ async function load(name) {
   const code = stripTypeScriptTypes(await readFile(new URL(`${name}.ets`, common), 'utf8'));
   return import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 }
-const { floorCopy, opensFloor, pullAccepted, pullDistance } = await load('QuickFloor');
+const { closesFloor, floorCopy, floorReveal, floorRise, opensFloor, pullAccepted, pullDistance } = await load('QuickFloor');
 const { DAY_LOOK, NIGHT_LOOK } = await load('Look');
 const index = await readFile(new URL('../entry/src/main/ets/pages/Index.ets', import.meta.url), 'utf8');
 
@@ -23,6 +23,27 @@ test('the top panel opens only on a downward, mostly vertical pull from the top'
   assert.equal(pullDistance(-10), 0);
   assert.equal(pullDistance(20), 9);
   assert.equal(pullDistance(200), 44);
+});
+
+test('upward exit is reserved for the bottom handle or end of the panel list', () => {
+  assert.equal(closesFloor(true, 3, -36), true);
+  assert.equal(closesFloor(true, 3, -35), false);
+  assert.equal(closesFloor(true, 70, -45), false);
+  assert.equal(closesFloor(true, 3, 60), false);
+  assert.equal(closesFloor(false, 0, -90), false);
+});
+
+test('floor motion has reversible clamped opacity and opposite palette', () => {
+  assert.equal(floorReveal(-1), 0);
+  assert.equal(floorReveal(45), 0.5);
+  assert.equal(floorReveal(90), 1);
+  assert.equal(floorReveal(100), 1);
+  assert.equal(floorRise(0), -48);
+  assert.equal(floorRise(0.5), -24);
+  assert.equal(floorRise(1), 0);
+  assert.match(index, /floorTheme\(\): Look \{ return this\.dark \? DAY_LOOK : NIGHT_LOOK; \}/);
+  assert.match(index, /\.opacity\(this\.floorProgress\)\.translate\(\{ y: floorRise\(this\.floorProgress\)/);
+  assert.doesNotMatch(index, /Button\('⌃ 返回页面'/);
 });
 
 test('all navigable pages have contextual controls and real handlers', () => {

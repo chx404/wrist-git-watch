@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "dev.wristgit.watch",
     "vendor": "Wrist Git",
-    "versionCode": 3,
-    "versionName": "0.3.0",
+    "versionCode": 14,
+    "versionName": "0.3.11",
     "icon": "$media:app_icon",
     "label": "$string:app_name"
   }

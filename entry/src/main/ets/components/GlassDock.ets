@@ -1,6 +1,6 @@
 import { curves } from '@kit.ArkUI';
 import { clampDockSlot, DOCK_HEIGHT, DOCK_LENS_HEIGHT, DOCK_RAIL_THICKNESS, DOCK_TOUCH_HEIGHT, DockGeometry,
-  dockDragSlot, dockDragTarget } from '../common/DockGeometry';
+  dockDragSlot, dockDragTarget, dockGlassOpacity } from '../common/DockGeometry';
 
 export class DockTab {
   readonly title: string;
@@ -17,22 +17,21 @@ export class DockTab {
 export struct GlassDock {
   @Prop @Watch('syncSelection') tabs: DockTab[] = [];
   @Prop @Watch('syncSelection') selected: number = 0;
-  @Prop @Watch('paintRail') dark: boolean = false;
+  @Prop dark: boolean = false;
   onSelect: (index: number) => void = () => {};
 
   @State private geometry: DockGeometry = new DockGeometry(0);
-  @State private lensSlot: number = 0;
+  @State private previewSlot: number = 0;
   @State private dragging: boolean = false;
   @State private groupScale: number = 1;
   private family: string = '';
   private morphTimer: number = -1;
-  private readonly rail: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private panOrigin: number = 0;
   private panActive: boolean = false;
   private settleTimer: number = -1;
 
   aboutToAppear(): void {
-    this.lensSlot = this.selectedSlot();
+    this.previewSlot = this.selectedSlot();
     this.family = this.tabs[0]?.key ?? '';
   }
 
@@ -71,9 +70,9 @@ export struct GlassDock {
     // Any external update (including Back) takes precedence over an in-flight scrub.
     this.panActive = false;
     const slot = this.selectedSlot();
-    if (!this.dragging && this.lensSlot === slot) { return; }
+    if (!this.dragging && this.previewSlot === slot) { return; }
     this.getUIContext().animateTo({ curve: curves.springMotion(0.28, 0.86, 0.12) }, () => {
-      this.lensSlot = slot;
+      this.previewSlot = slot;
       this.dragging = false;
     });
   }
@@ -84,7 +83,7 @@ export struct GlassDock {
       this.syncSelection();
       return;
     }
-    // The page owns selection. Leave navigation outside the lens animation transaction.
+    // The page owns selection. Leave navigation outside the glass animation transaction.
     this.onSelect(index);
     if (this.dragging && this.settleTimer < 0) {
       // If the host declines a swipe, spring back to the accepted prop instead of hanging mid-rail.
@@ -103,7 +102,7 @@ export struct GlassDock {
 
   private updatePan(offset: number): void {
     if (this.panActive) {
-      this.lensSlot = dockDragSlot(this.panOrigin, offset, this.geometry.slotWidth(this.tabs.length), this.tabs.length);
+      this.previewSlot = dockDragSlot(this.panOrigin, offset, this.geometry.slotWidth(this.tabs.length), this.tabs.length);
     }
   }
 
@@ -117,41 +116,13 @@ export struct GlassDock {
     if (Number.isFinite(width) && width > 0 && width !== this.geometry.width) {
       this.geometry = new DockGeometry(width);
     }
-    this.paintRail();
   }
 
-  private railStroke(radius: number, halfAngle: number, thickness: number, color: string | CanvasGradient): void {
-    const ctx = this.rail;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = thickness;
-    ctx.beginPath();
-    ctx.arc(this.geometry.centerX, this.geometry.centerY, radius, Math.PI / 2 - halfAngle, Math.PI / 2 + halfAngle);
-    ctx.stroke();
-  }
-
-  private paintRail(): void {
-    const arc = this.geometry;
-    const ctx = this.rail;
-    if (ctx.width <= 0 || arc.halfAngle <= 0.06) { return; }
-    ctx.clearRect(0, 0, arc.width, DOCK_HEIGHT);
-    ctx.lineCap = 'round';
-    const tint = ctx.createLinearGradient(arc.width * 0.25, 5, arc.width * 0.7, 44);
-    tint.addColorStop(0, this.dark ? 'rgba(61,87,116,0.89)' : 'rgba(255,255,255,0.92)');
-    tint.addColorStop(0.52, this.dark ? 'rgba(24,40,61,0.92)' : 'rgba(232,243,255,0.88)');
-    tint.addColorStop(1, this.dark ? 'rgba(19,37,55,0.95)' : 'rgba(200,223,248,0.9)');
-    this.railStroke(arc.radius, arc.halfAngle, DOCK_RAIL_THICKNESS + 1.5,
-      this.dark ? 'rgba(107,187,246,0.25)' : 'rgba(117,154,200,0.27)');
-    this.railStroke(arc.radius, arc.halfAngle, DOCK_RAIL_THICKNESS, tint);
-
-    // Offset the highlights radially, so they remain on the edges even at the tips.
-    const glint = ctx.createLinearGradient(0, 0, arc.width, 0);
-    glint.addColorStop(0, 'rgba(255,255,255,0)');
-    glint.addColorStop(0.3, this.dark ? 'rgba(199,229,255,0.45)' : 'rgba(255,255,255,0.98)');
-    glint.addColorStop(0.62, this.dark ? 'rgba(164,215,251,0.24)' : 'rgba(255,255,255,0.82)');
-    glint.addColorStop(1, 'rgba(255,255,255,0)');
-    this.railStroke(Math.max(1, arc.radius - 8), arc.halfAngle - 0.035, 1, glint);
-    this.railStroke(arc.radius + 8, arc.halfAngle - 0.055, 0.8,
-      this.dark ? 'rgba(111,222,241,0.23)' : 'rgba(159,207,230,0.58)');
+  @Builder
+  railStroke(radiusShift: number, inset: number, thickness: number, color: string) {
+    Path({ width: this.geometry.width, height: DOCK_HEIGHT, commands: this.geometry.strokePath(radiusShift, inset) })
+      .fill(Color.Transparent).stroke(color).strokeWidth(thickness).strokeLineCap(LineCapStyle.Round)
+      .position({ x: 0, y: 0 }).hitTestBehavior(HitTestMode.None)
   }
 
   private indexOf(key: string): number {
@@ -160,9 +131,9 @@ export struct GlassDock {
 
   private hitBand(index: number, relative: boolean = false): Rectangle {
     const width = this.geometry.slotWidth(this.tabs.length);
-    const offset = relative ? this.geometry.slotY(index, this.tabs.length) - DOCK_RAIL_THICKNESS / 2 : 0;
+    const offset = relative ? this.geometry.cellTop(index, this.tabs.length) : 0;
     return {
-      x: relative ? 0 : this.geometry.slotX(index, this.tabs.length) - width / 2,
+      x: relative ? 0 : this.geometry.cellLeft(index, this.tabs.length),
       y: this.geometry.touchTop(index, this.tabs.length) - offset,
       width,
       height: DOCK_TOUCH_HEIGHT
@@ -178,7 +149,7 @@ export struct GlassDock {
   }
 
   @Builder
-  lens() {
+  cellGlass(tab: DockTab) {
     Stack() {
       Stack({ alignContent: Alignment.Top }) {
         Row()
@@ -190,59 +161,59 @@ export struct GlassDock {
             [Color.Transparent, 1]] })
       }
       .width('100%').height('100%').borderRadius(DOCK_LENS_HEIGHT / 2)
-      .backgroundBlurStyle(BlurStyle.Thin, { colorMode: this.dark ? ThemeColorMode.DARK : ThemeColorMode.LIGHT, scale: 0.65 })
       .linearGradient({ angle: 155, colors: [
         [this.dark ? '#B96CBAF5' : '#F1FFFFFF', 0],
         [this.dark ? '#9C31598D' : '#ABE4F5FF', 0.46],
         [this.dark ? '#C5327899' : '#E2B9E9FF', 1]
       ] })
       .border({ width: 0.8, color: this.dark ? '#C48FD4FF' : '#EAFFFFFF' })
-      .clip(true)
       .shadow({ radius: 4, color: this.dark ? '#7849CBFF' : '#685899D9', offsetX: 0, offsetY: 0 })
       .scale({ x: this.dragging ? 1.06 : 1, y: this.dragging ? 0.93 : 1 })
     }
     .width(this.geometry.lensWidth(this.tabs.length)).height(DOCK_LENS_HEIGHT)
-    .position({
-      x: this.geometry.centerX - this.geometry.lensWidth(this.tabs.length) / 2,
-      y: this.geometry.centerY + this.geometry.radius - DOCK_LENS_HEIGHT / 2
-    })
-    // Tween a single native transform about the face center; x/y tweens would cut across the arc.
-    .rotate({ z: 1, centerX: '50%', centerY: DOCK_LENS_HEIGHT / 2 - this.geometry.radius,
-      angle: -this.geometry.slotAngle(this.lensSlot, this.tabs.length) * 180 / Math.PI })
+    .opacity(dockGlassOpacity(this.indexOf(tab.key), this.previewSlot))
     .accessibilityLevel('no-hide-descendants')
     .hitTestBehavior(HitTestMode.None)
   }
 
   @Builder
-  dockButton(tab: DockTab) {
-    Button(tab.title, { type: ButtonType.Capsule })
-      .width(this.geometry.slotWidth(this.tabs.length)).height(DOCK_RAIL_THICKNESS).padding(0).fontSize(11)
-      .fontWeight(this.indexOf(tab.key) === this.selectedSlot() ? FontWeight.Bold : FontWeight.Medium)
-      .fontColor(this.indexOf(tab.key) === Math.round(this.lensSlot) ? (this.dark ? '#FFFFFF' : '#0C3764') :
-        (this.dark ? '#D5E1F1' : '#394F67'))
-      .position({
-        x: this.geometry.slotX(this.indexOf(tab.key), this.tabs.length) - this.geometry.slotWidth(this.tabs.length) / 2,
-        y: this.geometry.slotY(this.indexOf(tab.key), this.tabs.length) - DOCK_RAIL_THICKNESS / 2
-      })
-      .backgroundColor(Color.Transparent).stateEffect(false)
-      .responseRegion(this.hitBand(this.indexOf(tab.key), true))
-      .accessibilitySelected(this.indexOf(tab.key) === this.selectedSlot())
-      .onClick(() => { this.requestSelection(this.indexOf(tab.key)); })
+  dockCell(tab: DockTab) {
+    Button({ type: ButtonType.Capsule }) {
+      // Glass and text share this native center. Only the whole button is positioned on the rail.
+      Stack({ alignContent: Alignment.Center }) {
+        this.cellGlass(tab)
+        Text(tab.title)
+          .fontSize(11).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .fontWeight(this.indexOf(tab.key) === this.selectedSlot() ? FontWeight.Bold : FontWeight.Medium)
+          .fontColor(this.indexOf(tab.key) === Math.round(this.previewSlot) ? (this.dark ? '#FFFFFF' : '#0C3764') :
+            (this.dark ? '#D5E1F1' : '#394F67'))
+          .accessibilityLevel('no').hitTestBehavior(HitTestMode.None)
+      }
+      .width('100%').height('100%')
+    }
+    .width(this.geometry.slotWidth(this.tabs.length)).height(DOCK_RAIL_THICKNESS).padding(0)
+    .position({
+      x: this.geometry.cellLeft(this.indexOf(tab.key), this.tabs.length),
+      y: this.geometry.cellTop(this.indexOf(tab.key), this.tabs.length)
+    })
+    .backgroundColor(Color.Transparent).stateEffect(false).clip(false)
+    .responseRegion(this.hitBand(this.indexOf(tab.key), true))
+    .accessibilityText(this.indexOf(tab.key) === this.selectedSlot() ? `${tab.title}，已选中` : tab.title)
+    .onClick(() => { this.requestSelection(this.indexOf(tab.key)); })
   }
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      Canvas(this.rail).width('100%').height(DOCK_HEIGHT)
-        .onReady(() => { this.measureRail(this.rail.width); })
-        .onSizeChange((_old: SizeOptions, next: SizeOptions) => { this.measureRail(Number(next.width)); })
-        .hitTestBehavior(HitTestMode.None)
-        .accessibilityLevel('no')
       if (this.geometry.width > 0 && this.tabs.length > 0) {
-        this.lens()
-        ForEach(this.tabs, (tab: DockTab) => { this.dockButton(tab) }, (tab: DockTab) => tab.key)
+        this.railStroke(0, 0, DOCK_RAIL_THICKNESS + 1.5, this.dark ? '#506BBCF6' : '#48759AC8')
+        this.railStroke(0, 0, DOCK_RAIL_THICKNESS, this.dark ? '#EA223952' : '#E1E2F0FF')
+        this.railStroke(-8, 0.035, 1, this.dark ? '#64C7E5FF' : '#F8FFFFFF')
+        this.railStroke(8, 0.055, 0.8, this.dark ? '#416FDEF1' : '#949FCFE6')
+        ForEach(this.tabs, (tab: DockTab) => { this.dockCell(tab) }, (tab: DockTab) => tab.key)
       }
     }
     .width('100%').height(DOCK_HEIGHT)
+    .onAreaChange((_old: Area, next: Area) => { this.measureRail(Number(next.width)); })
     .scale({ x: this.groupScale, y: this.groupScale, centerX: '50%', centerY: '100%' })
     .responseRegion(this.hitBands())
     .priorityGesture(PanGesture({ direction: PanDirection.Horizontal, distance: 5 })

@@ -32,6 +32,20 @@ export function opensFloor(atTop: boolean, x: number, y: number): boolean {
   return pullAccepted(atTop, x, y) && y >= 36;
 }
 
+export function floorReveal(down: number): number {
+  if (!Number.isFinite(down)) { return 0; }
+  return Math.max(0, Math.min(1, down / 90));
+}
+
+export function floorRise(progress: number): number {
+  if (!Number.isFinite(progress)) { return -48; }
+  return 48 * (Math.max(0, Math.min(1, progress)) - 1);
+}
+
+export function closesFloor(fromDismissArea: boolean, x: number, y: number): boolean {
+  return pullAccepted(fromDismissArea, x, -y) && y <= -36;
+}
+
 export function floorCopy(kind: string): FloorCopy {
   switch (kind) {
     case 'home': return new FloorCopy('发现', '选择首页内容与榜单周期', [
@@ -93,6 +107,8 @@ export function floorCopy(kind: string): FloorCopy {
       new FloorAction('web', '在 GitHub 查看仓库', '↗'), new FloorAction('back', '返回仓库', '‹')]);
     case 'shared': return new FloorCopy('分享链接', '确认之后才会打开仓库', [
       new FloorAction('acceptShared', '打开这个仓库', '↗'), new FloorAction('back', '取消并返回', '‹')]);
+    case 'deviceAuth': return new FloorCopy('扫码连接', '用手机扫码完成 GitHub 授权', [
+      new FloorAction('deviceRegen', '重新生成验证码', '↻'), new FloorAction('back', '返回设置', '‹')]);
     default: return new FloorCopy('快捷面板', '回到当前页面开头，或切换外观', []);
   }
 }

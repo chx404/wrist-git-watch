@@ -29,6 +29,15 @@ export class DockGeometry {
     this.tabSpan = Math.min(this.width, 2 * (halfSpan + 8));
   }
 
+  strokePath(radiusShift: number = 0, inset: number = 0): string {
+    const radius = Math.max(1, this.radius + radiusShift);
+    const halfAngle = Math.max(0, this.halfAngle - inset);
+    if (this.width <= 0 || halfAngle === 0) { return 'M 0 0'; }
+    const half = radius * Math.sin(halfAngle);
+    const y = this.centerY + radius * Math.cos(halfAngle);
+    return `M ${(this.centerX - half).toFixed(3)} ${y.toFixed(3)} A ${radius.toFixed(3)} ${radius.toFixed(3)} 0 0 0 ${(this.centerX + half).toFixed(3)} ${y.toFixed(3)}`;
+  }
+
   slotWidth(count: number): number {
     return this.tabSpan / Math.max(1, count);
   }
@@ -46,6 +55,14 @@ export class DockGeometry {
     return this.centerY + this.radius * Math.cos(this.slotAngle(slot, count));
   }
 
+  cellLeft(slot: number, count: number): number {
+    return this.slotX(slot, count) - this.slotWidth(count) / 2;
+  }
+
+  cellTop(slot: number, count: number): number {
+    return this.slotY(slot, count) - DOCK_RAIL_THICKNESS / 2;
+  }
+
   touchTop(slot: number, count: number): number {
     return Math.max(0, Math.min(DOCK_HEIGHT - DOCK_TOUCH_HEIGHT, this.slotY(slot, count) - DOCK_TOUCH_HEIGHT / 2));
   }
@@ -61,6 +78,11 @@ export function clampDockSlot(slot: number, count: number): number {
 
 export function dockDragSlot(origin: number, offset: number, width: number, count: number): number {
   return clampDockSlot(width > 0 ? origin + offset / width : origin, count);
+}
+
+// A fractional preview blends only its two adjacent, stationary glass cells.
+export function dockGlassOpacity(slot: number, previewSlot: number): number {
+  return Math.max(0, 1 - Math.abs(slot - previewSlot));
 }
 
 export function dockDragTarget(origin: number, offset: number, width: number, count: number): number {
